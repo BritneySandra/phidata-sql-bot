@@ -1,10 +1,11 @@
+# Install required ODBC + compiler packages
 [phases.setup]
-# No custom libraries needed, Python environment is enough
-
-[phases.build]
-cmds = [
-  "pip install -r requirements.txt"
+aptPkgs = [
+  "unixodbc",
+  "unixodbc-dev",
+  "msodbcsql18",
+  "g++",
+  "build-essential"
 ]
 
-[phases.start]
-cmd = "uvicorn main:app --host 0.0.0.0 --port $PORT"
+# No custom build command needed — pip install will work normally
