@@ -5,3 +5,5 @@ groq
 requests
 sqlalchemy
 pymysql
+pyodbc==5.1.0
+
