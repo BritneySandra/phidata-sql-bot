@@ -1,7 +1,7 @@
-phidata
 fastapi
 uvicorn
-pandas
-pyodbc
-python-dotenv
-streamlit
+pydantic
+groq
+requests
+sqlalchemy
+pymysql
