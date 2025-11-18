@@ -5,7 +5,7 @@ groq
 requests
 sqlalchemy
 pymysql
-pymssql==2.2.7
+pyodbc==5.0.1
 
 
 
