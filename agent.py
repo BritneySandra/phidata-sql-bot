@@ -1,7 +1,7 @@
 from groq import Groq
 import os
 import json
-import pyodbc
+import pymssql
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -12,13 +12,13 @@ TABLE_NAME = "WBI_BI_Data_V2"
 def load_sql_columns():
     """Load column names dynamically from the SQL table."""
     try:
-        conn = pyodbc.connect(
-            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
-            f"SERVER={os.getenv('SQL_SERVER')};"
-            f"DATABASE={os.getenv('SQL_DATABASE')};"
-            f"UID={os.getenv('SQL_USERNAME')};"
-            f"PWD={os.getenv('SQL_PASSWORD')};"
-        )
+        conn = pymssql.connect(
+    server=os.getenv('SQL_SERVER'),
+    user=os.getenv('SQL_USERNAME'),
+    password=os.getenv('SQL_PASSWORD'),
+    database=os.getenv('SQL_DATABASE')
+)
+
         cursor = conn.cursor()
         cursor.execute(f"""
             SELECT COLUMN_NAME

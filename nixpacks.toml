@@ -1,13 +1,10 @@
 [phases.setup]
-aptPkgs = [
-  "unixodbc",
-  "unixodbc-dev",
-  "msodbcsql17",
-  "g++",
-  "build-essential"
+# No custom libraries needed, Python environment is enough
+
+[phases.build]
+cmds = [
+  "pip install -r requirements.txt"
 ]
 
-[phases.preinstall]
-cmds = [
-  "bash ./install-odbc.sh"
-]
+[phases.start]
+cmd = "uvicorn main:app --host 0.0.0.0 --port $PORT"
