@@ -6,3 +6,8 @@ aptPkgs = [
   "g++",
   "build-essential"
 ]
+
+[phases.preinstall]
+cmds = [
+  "bash ./install-odbc.sh"
+]
