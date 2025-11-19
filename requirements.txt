@@ -4,6 +4,8 @@ pydantic
 groq
 requests
 sqlalchemy
+pyodbc
+python-dotenv
 
 
 
