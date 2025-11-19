@@ -1,3 +1,7 @@
+# ---------------------------------------------------------
+# agent.py  (FINAL VERSION - handles ANY user question)
+# ---------------------------------------------------------
+
 from groq import Groq
 import os
 import json
@@ -9,11 +13,10 @@ load_dotenv()
 TABLE_NAME = "WBI_BI_Data_V2"
 
 
-# --------------------------
-# SQL COLUMN LOADING
-# --------------------------
+# ---------------------------------------------------------
+# LOAD SQL COLUMNS (Lazy)
+# ---------------------------------------------------------
 def load_sql_columns():
-    """Load column names dynamically from SQL Server."""
     try:
         conn = pyodbc.connect(
             f"DRIVER={{ODBC Driver 18 for SQL Server}};"
@@ -24,25 +27,16 @@ def load_sql_columns():
             f"Encrypt=no;"
             f"TrustServerCertificate=yes;",
         )
-
         cursor = conn.cursor()
-        cursor.execute(f"""
-            SELECT COLUMN_NAME
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_NAME = '{TABLE_NAME}'
-        """)
-        columns = [row.COLUMN_NAME for row in cursor.fetchall()]
+        cursor.execute(f"SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='{TABLE_NAME}'")
+        cols = [row.COLUMN_NAME for row in cursor.fetchall()]
         conn.close()
-
-        print("🔍 Loaded SQL Columns:", columns)
-        return columns
-
+        return cols
     except Exception as e:
-        print(f"⚠ SQL load failed: {e}")
+        print("❌ Column load failed:", e)
         return []
 
 
-# Lazy-loaded global
 SQL_COLUMNS = []
 
 
@@ -53,77 +47,82 @@ def get_sql_columns():
     return SQL_COLUMNS
 
 
-# --------------------------
-# GROQ CLIENT
-# --------------------------
+# ---------------------------------------------------------
+# LLM CLIENT
+# ---------------------------------------------------------
 def get_client():
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
+    key = os.getenv("GROQ_API_KEY")
+    if not key:
         raise Exception("Missing GROQ_API_KEY")
+    return Groq(api_key=key)
 
-    return Groq(api_key=api_key)
 
-
-# --------------------------
-# NLP HELPERS
-# --------------------------
+# ---------------------------------------------------------
+# SYNONYMS & NLP HELPERS
+# ---------------------------------------------------------
 METRIC_SYNONYMS = {
     "revenue": "REVAmount",
-    "sales": "REVAmount",
     "total revenue": "REVAmount",
-    "rev": "REVAmount",
+    "sales": "REVAmount",
+    "income": "REVAmount",
+    "turnover": "REVAmount",
 
     "cost": "CSTAmount",
     "expense": "CSTAmount",
+    "spend": "CSTAmount",
 
     "profit": "JobProfit",
-    "jobprofit": "JobProfit",
-    "margin": "JobProfit"
+    "margin": "JobProfit",
+    "earnings": "JobProfit"
 }
 
 TRANSPORT_KEYWORDS = ["SEA", "AIR", "ROAD", "RAIL", "COU", "FSA", "NOJ", "UNKNOWN"]
 
 
-# --------------------------
-# LLM PARSER
-# --------------------------
+# ---------------------------------------------------------
+# MAIN EXTRACTION LOGIC
+# ---------------------------------------------------------
 def extract_query(question):
-    client = get_client()  # lazy load
-    SQL_COLUMNS = get_sql_columns()  # lazy load
 
+    SQL_COLUMNS = get_sql_columns()
+    client = get_client()
+
+    # ---- LLM Prompt ----
     prompt = f"""
-You are a JSON-only assistant.  
-Return ONLY valid JSON — no text outside JSON.
+You are a JSON-only assistant (STRICT).
+Return ONLY valid JSON. No explanation.
 
-Use only these SQL columns:
+Using only these SQL columns:
 {SQL_COLUMNS}
 
-Convert the user question into this JSON:
+Convert the user question into:
+
 {{
-  "metric": "<one SQL column or null>",
-  "aggregation": "sum | avg | count | max | min",
+  "metric": "column-name or null",
+  "aggregation": "sum | avg | max | min | count",
   "year": 2024,
   "mode": "SEA"
 }}
 
-Rules:
-- If no metric found → "metric": null
-- If no year found → "year": null
-- If no mode found → "mode": null
+RULES:
+- If metric not found → metric = null
+- If aggregation unclear → aggregation = "sum"
+- If year not in question → year = null
+- If mode not in question → mode = null
 
-User Question: "{question}"
-JSON:
+User question: "{question}"
+
+Return ONLY JSON:
 """
 
     response = client.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}],
         temperature=0,
-        max_tokens=120
+        max_tokens=150
     )
 
     raw = response.choices[0].message.content.strip()
-    print("\nRAW LLM JSON:\n", raw, "\n")
 
     # Safe parse
     try:
@@ -131,27 +130,28 @@ JSON:
     except:
         parsed = {"metric": None, "aggregation": "sum", "year": None, "mode": None}
 
-    # --------------------------
-    # FIX METRIC IF NULL
-    # --------------------------
+    # ---------------------------------------------------------
+    # FALLBACK 1: Metric Correction
+    # ---------------------------------------------------------
+    q_lower = question.lower()
+
     if not parsed.get("metric") or parsed["metric"] not in SQL_COLUMNS:
-        q = question.lower()
-        for k, col in METRIC_SYNONYMS.items():
-            if k in q:
+        for syn, col in METRIC_SYNONYMS.items():
+            if syn in q_lower:
                 parsed["metric"] = col
                 break
 
-    # --------------------------
-    # FIX MODE
-    # --------------------------
+    # Still null? Choose BEST COLUMN automatically
+    if parsed.get("metric") not in SQL_COLUMNS:
+        parsed["metric"] = "REVAmount"     # default best guess
+
+    # ---------------------------------------------------------
+    # FALLBACK 2: Mode Detection
+    # ---------------------------------------------------------
     if not parsed.get("mode"):
         for m in TRANSPORT_KEYWORDS:
-            if m.lower() in question.lower():
+            if m.lower() in q_lower:
                 parsed["mode"] = m
                 break
-
-    # Final validation
-    if parsed.get("metric") not in SQL_COLUMNS:
-        parsed["metric"] = None
 
     return parsed
