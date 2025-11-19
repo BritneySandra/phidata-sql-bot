@@ -1,6 +1,6 @@
 FROM python:3.10-slim
 
-# Install system dependencies
+# Install dependencies
 RUN apt-get update && apt-get install -y \
     curl \
     gnupg \
@@ -9,26 +9,27 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Microsoft ODBC Driver 17 for SQL Server
+# Install MS ODBC Driver 18 for SQL Server (Debian 12 compatible)
 RUN curl https://packages.microsoft.com/keys/microsoft.asc | apt-key add - && \
-    curl https://packages.microsoft.com/config/debian/10/prod.list > /etc/apt/sources.list.d/mssql-release.list && \
-    apt-get update && ACCEPT_EULA=Y apt-get install -y msodbcsql17 && \
+    curl https://packages.microsoft.com/config/debian/12/prod.list > /etc/apt/sources.list.d/mssql-release.list && \
+    apt-get update && ACCEPT_EULA=Y apt-get install -y msodbcsql18 mssql-tools18 && \
+    echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc && \
     apt-get clean -y
 
-# Create working directory
+# Set working directory
 WORKDIR /app
 
 # Copy requirements
 COPY requirements.txt .
 
-# Install Python packages (including pyodbc)
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy the application code
+# Copy the rest of the app
 COPY . .
 
 # Expose port
 EXPOSE 8000
 
-# Run FastAPI using Uvicorn
+# Start the app
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
