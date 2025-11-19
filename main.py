@@ -27,42 +27,136 @@ async def root():
 async def health():
     return {"status": "healthy"}
 
+
+# ---------------------------------------------------------------------
+# 🔥 DARK MODE CHATGPT STYLE CHAT UI  (Power BI compatible)
+# ---------------------------------------------------------------------
 @app.get("/chat", response_class=HTMLResponse)
 async def chat_ui():
     return """
-    <html>
-    <body style="font-family: Arial; padding: 20px;">
-        <h2>PhiData SQL Chatbot</h2>
-        <input id="q" style="width:80%;padding:8px;" placeholder="Ask any question">
-        <button onclick="ask()">Send</button>
-        <pre id="a" style="margin-top:20px;background:#eee;padding:10px;"></pre>
+<!DOCTYPE html>
+<html>
+<head>
+<title>PhiData SQL Chatbot</title>
 
-        <script>
-            async function ask() {
-                let q = document.getElementById("q").value;
-                let res = await fetch('/ask', {
-                    method: 'POST',
-                    headers: {'Content-Type':'application/json'},
-                    body: JSON.stringify({question: q})
-                });
-                let data = await res.json();
-                // Present result neatly
-                if (data.rows) {
-                    let html = "SQL:\\n" + data.sql + "\\n\\nResult:\\n";
-                    // Header row
-                    if (data.columns && data.columns.length) {
-                        html += data.columns.join(" | ") + "\\n";
-                    }
-                    html += data.rows.map(r => Object.values(r).join(" | ")).join("\\n");
-                    document.getElementById("a").innerText = html;
-                } else {
-                    document.getElementById("a").innerText = "SQL:\\n" + data.sql + "\\n\\nAnswer:\\n" + data.result;
-                }
-            }
-        </script>
-    </body>
-    </html>
+<style>
+body {
+    background-color: #0d1117;
+    font-family: Arial, sans-serif;
+    color: #e6edf3;
+    margin: 0;
+    padding: 20px;
+}
+#chat-container {
+    max-width: 900px;
+    margin: auto;
+}
+h2 {
+    color: #58a6ff;
+    margin-bottom: 20px;
+}
+#q {
+    width: 80%;
+    padding: 12px;
+    border-radius: 6px;
+    border: 1px solid #30363d;
+    background: #161b22;
+    color: white;
+    outline: none;
+}
+#q::placeholder {
+    color: #8b949e;
+}
+button {
+    padding: 12px 20px;
+    background: #238636;
+    border: none;
+    color: white;
+    border-radius: 6px;
+    cursor: pointer;
+}
+button:hover {
+    background: #2ea043;
+}
+.chat-box {
+    background: #161b22;
+    border: 1px solid #30363d;
+    padding: 15px;
+    margin-top: 20px;
+    border-radius: 8px;
+    white-space: pre-wrap;
+    font-size: 14px;
+    overflow-x: auto;
+}
+.result-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 10px;
+}
+.result-table th, .result-table td {
+    border: 1px solid #30363d;
+    padding: 8px;
+    background: #0d1117;
+}
+</style>
+
+</head>
+<body>
+<div id="chat-container">
+    <h2>PhiData SQL Chatbot</h2>
+
+    <input id="q" placeholder="Ask any question...">
+    <button onclick="ask()">Send</button>
+
+    <div id="a" class="chat-box"></div>
+</div>
+
+
+<script>
+async function ask() {
+    let q = document.getElementById("q").value;
+    document.getElementById("a").innerHTML = "<i>Thinking...</i>";
+
+    let res = await fetch('/ask', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({question: q})
+    });
+
+    let data = await res.json();
+
+    let html = "<b>SQL:</b><br>" + data.sql + "<br><br>";
+
+    // If table rows exist → show proper table
+    if (data.rows) {
+        html += "<b>Result:</b><br>";
+        html += "<table class='result-table'>";
+
+        if (data.columns) {
+            html += "<tr>";
+            data.columns.forEach(c => html += "<th>" + c + "</th>");
+            html += "</tr>";
+        }
+
+        data.rows.forEach(r => {
+            html += "<tr>";
+            Object.values(r).forEach(v => html += "<td>" + v + "</td>");
+            html += "</tr>";
+        });
+
+        html += "</table>";
+    } else {
+        html += "<b>Answer:</b><br>" + data.result;
+    }
+
+    document.getElementById("a").innerHTML = html;
+}
+</script>
+
+</body>
+</html>
     """
+
 
 class Query(BaseModel):
     question: str
@@ -79,12 +173,13 @@ async def ask(q: Query):
     category_value = parsed.get("category_value")
     compare = parsed.get("compare", [])
 
-    # Validate metric and schema
     schema = get_schema()
     if not metric or metric not in schema:
-        return JSONResponse({"sql": None, "result": "❌ Unknown metric (I couldn't find a numeric column to aggregate)."}, status_code=200)
+        return JSONResponse({
+            "sql": None,
+            "result": "❌ Unknown metric (I couldn't find a numeric column)."
+        })
 
-    # Build WHERE and params from time filters
     where_clauses = []
     params = []
 
@@ -98,7 +193,6 @@ async def ask(q: Query):
         where_clauses.append("FinancialMonth = ?")
         params.append(time["month"])
 
-    # If a specific category value is present, add that filter
     if group_col and category_value:
         where_clauses.append(f"{group_col} = ?")
         params.append(category_value)
@@ -108,10 +202,8 @@ async def ask(q: Query):
     agg_map = {"sum":"SUM","avg":"AVG","max":"MAX","min":"MIN","count":"COUNT"}
     agg_sql = agg_map.get(agg,"SUM")
 
-    # CASE A: group_by + no specific value => run GROUP BY to return all categorical buckets
+    # CASE A → full category breakdown
     if group_by and group_col and not category_value and not compare:
-        if group_col not in schema:
-            return JSONResponse({"sql": None, "result": f"❌ Unknown group column {group_col}"})
         sql = f"""
             SELECT {group_col} AS category, {agg_sql}([{metric}]) AS value
             FROM {TABLE}
@@ -120,40 +212,39 @@ async def ask(q: Query):
             ORDER BY value DESC
         """
         rows = run_sql(sql, params)
-        return {"sql": sql, "result": f"{len(rows)} rows", "columns":["category","value"], "rows": rows}
+        return {"sql": sql, "columns":["category","value"], "rows": rows}
 
-    # CASE B: comparison (user asked to compare some values) e.g., compare sea and air
+    # CASE B → compare categories
     if compare and group_col:
         placeholders = ",".join("?" for _ in compare)
-        # if there are other time filters, combine them
-        where_with_compare = (where_clause + " AND " if where_clause != "1=1" else "") + f"{group_col} IN ({placeholders})"
+        where_plus = where_clause + " AND " if where_clause != "1=1" else ""
+        where_plus += f"{group_col} IN ({placeholders})"
+
         sql = f"""
             SELECT {group_col} AS category, {agg_sql}([{metric}]) AS value
             FROM {TABLE}
-            WHERE {where_with_compare}
+            WHERE {where_plus}
             GROUP BY {group_col}
             ORDER BY value DESC
         """
-        params_full = params + compare
-        rows = run_sql(sql, params_full)
-        return {"sql": sql, "result": f"{len(rows)} rows", "columns":[group_col,"value"], "rows": rows}
+        rows = run_sql(sql, params + compare)
+        return {"sql": sql, "columns":[group_col,"value"], "rows": rows}
 
-    # CASE C: specific category value + aggregate (single scalar or group if asked)
+    # CASE C → specific category value
     if group_col and category_value:
-        # We already added filter above. If user still wanted group_by after filtering (rare),
-        # we can return group_by by another dimension - but usually return single aggregate.
         sql = f"""
             SELECT {agg_sql}([{metric}]) AS value
             FROM {TABLE}
             WHERE {where_clause}
         """
         rows = run_sql(sql, params)
-        if not rows or not rows[0].get("value") and rows[0].get("value") is not None:
+        if not rows or rows[0].get("value") is None:
             return {"sql": sql, "result": "No data found"}
-        value = rows[0]["value"]
-        return {"sql": sql, "result": f"{agg} of {metric} for {group_col} = {category_value} is {value:,}"}
 
-    # CASE D: no group_by / default single aggregate
+        value = rows[0]["value"]
+        return {"sql": sql, "result": f"{metric} for {category_value} = {value:,}"}
+
+    # CASE D → simple aggregate
     sql = f"""
         SELECT {agg_sql}([{metric}]) AS value
         FROM {TABLE}
@@ -162,8 +253,6 @@ async def ask(q: Query):
     rows = run_sql(sql, params)
     if not rows or rows[0].get("value") is None:
         return {"sql": sql, "result": "No data found"}
+
     value = rows[0]["value"]
-    result_text = f"{agg} of {metric} is {value:,}"
-    if time.get("year"):
-        result_text += f" in {time['year']}"
-    return {"sql": sql, "result": result_text}
+    return {"sql": sql, "result": f"{agg} of {metric} is {value:,}"}
