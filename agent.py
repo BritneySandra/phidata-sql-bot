@@ -12,7 +12,7 @@ def load_sql_columns():
     """Load column names dynamically from the SQL table."""
     try:
         conn = pyodbc.connect(
-            f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+            f"DRIVER={{ODBC Driver 18 for SQL Server}};"
             f"SERVER={os.getenv('SQL_SERVER')};"
             f"DATABASE={os.getenv('SQL_DATABASE')};"
             f"UID={os.getenv('SQL_USERNAME')};"

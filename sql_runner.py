@@ -6,8 +6,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def run_sql(sql, params=None):
-    conn = pyodbc.connect(
-        f"DRIVER={{ODBC Driver 17 for SQL Server}};"
+   conn = pyodbc.connect(
+        f"DRIVER={{ODBC Driver 18 for SQL Server}};"
         f"SERVER={os.getenv('SQL_SERVER')};"
         f"DATABASE={os.getenv('SQL_DATABASE')};"
         f"UID={os.getenv('SQL_USERNAME')};"
