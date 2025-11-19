@@ -48,8 +48,11 @@ async def chat_ui():
                 let data = await res.json();
                 // Present result neatly
                 if (data.rows) {
-                    // build table
                     let html = "SQL:\\n" + data.sql + "\\n\\nResult:\\n";
+                    // Header row
+                    if (data.columns && data.columns.length) {
+                        html += data.columns.join(" | ") + "\\n";
+                    }
                     html += data.rows.map(r => Object.values(r).join(" | ")).join("\\n");
                     document.getElementById("a").innerText = html;
                 } else {
@@ -73,7 +76,13 @@ async def ask(q: Query):
     time = parsed.get("time", {})
     group_by = parsed.get("group_by", False)
     group_col = parsed.get("group_column")
+    category_value = parsed.get("category_value")
     compare = parsed.get("compare", [])
+
+    # Validate metric and schema
+    schema = get_schema()
+    if not metric or metric not in schema:
+        return JSONResponse({"sql": None, "result": "❌ Unknown metric (I couldn't find a numeric column to aggregate)."}, status_code=200)
 
     # Build WHERE and params from time filters
     where_clauses = []
@@ -89,15 +98,18 @@ async def ask(q: Query):
         where_clauses.append("FinancialMonth = ?")
         params.append(time["month"])
 
+    # If a specific category value is present, add that filter
+    if group_col and category_value:
+        where_clauses.append(f"{group_col} = ?")
+        params.append(category_value)
+
     where_clause = " AND ".join(where_clauses) if where_clauses else "1=1"
 
     agg_map = {"sum":"SUM","avg":"AVG","max":"MAX","min":"MIN","count":"COUNT"}
     agg_sql = agg_map.get(agg,"SUM")
 
-    # If group_by requested & group_col available -> run GROUP BY query
-    schema = get_schema()
-    if group_by and group_col:
-        # ensure group_col exists in schema
+    # CASE A: group_by + no specific value => run GROUP BY to return all categorical buckets
+    if group_by and group_col and not category_value and not compare:
         if group_col not in schema:
             return JSONResponse({"sql": None, "result": f"❌ Unknown group column {group_col}"})
         sql = f"""
@@ -105,33 +117,43 @@ async def ask(q: Query):
             FROM {TABLE}
             WHERE {where_clause}
             GROUP BY {group_col}
-            ORDER BY {group_col}
+            ORDER BY value DESC
         """
         rows = run_sql(sql, params)
-        # format result rows
-        if not rows:
-            return {"sql": sql, "result": "No data found", "rows": []}
-        # return structured rows and a printable table
-        return {"sql": sql, "result": f"{len(rows)} rows", "rows": rows}
+        return {"sql": sql, "result": f"{len(rows)} rows", "columns":["category","value"], "rows": rows}
 
-    # If user asked to compare multiple category values (e.g., compare sea and air)
+    # CASE B: comparison (user asked to compare some values) e.g., compare sea and air
     if compare and group_col:
         placeholders = ",".join("?" for _ in compare)
-        where_with_compare = where_clause + f" AND {group_col} IN ({placeholders})" if where_clause != "1=1" else f"{group_col} IN ({placeholders})"
+        # if there are other time filters, combine them
+        where_with_compare = (where_clause + " AND " if where_clause != "1=1" else "") + f"{group_col} IN ({placeholders})"
         sql = f"""
             SELECT {group_col} AS category, {agg_sql}([{metric}]) AS value
             FROM {TABLE}
             WHERE {where_with_compare}
             GROUP BY {group_col}
-            ORDER BY {group_col}
+            ORDER BY value DESC
         """
         params_full = params + compare
         rows = run_sql(sql, params_full)
-        if not rows:
-            return {"sql": sql, "result": "No data found", "rows": []}
-        return {"sql": sql, "result": f"{len(rows)} rows", "rows": rows}
+        return {"sql": sql, "result": f"{len(rows)} rows", "columns":[group_col,"value"], "rows": rows}
 
-    # Otherwise single aggregate
+    # CASE C: specific category value + aggregate (single scalar or group if asked)
+    if group_col and category_value:
+        # We already added filter above. If user still wanted group_by after filtering (rare),
+        # we can return group_by by another dimension - but usually return single aggregate.
+        sql = f"""
+            SELECT {agg_sql}([{metric}]) AS value
+            FROM {TABLE}
+            WHERE {where_clause}
+        """
+        rows = run_sql(sql, params)
+        if not rows or not rows[0].get("value") and rows[0].get("value") is not None:
+            return {"sql": sql, "result": "No data found"}
+        value = rows[0]["value"]
+        return {"sql": sql, "result": f"{agg} of {metric} for {group_col} = {category_value} is {value:,}"}
+
+    # CASE D: no group_by / default single aggregate
     sql = f"""
         SELECT {agg_sql}([{metric}]) AS value
         FROM {TABLE}
@@ -144,6 +166,4 @@ async def ask(q: Query):
     result_text = f"{agg} of {metric} is {value:,}"
     if time.get("year"):
         result_text += f" in {time['year']}"
-    if group_col:
-        result_text += f" grouped by {group_col}"
     return {"sql": sql, "result": result_text}
