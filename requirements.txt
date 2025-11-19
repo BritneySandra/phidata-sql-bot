@@ -6,6 +6,7 @@ requests
 sqlalchemy
 pyodbc
 python-dotenv
+pandas
 
 
 
