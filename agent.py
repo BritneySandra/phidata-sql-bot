@@ -9,17 +9,23 @@ load_dotenv()
 TABLE_NAME = "WBI_BI_Data_V2"
 
 
+# --------------------------
+# SQL COLUMN LOADING
+# --------------------------
 def load_sql_columns():
-    """Load column names dynamically from the SQL table."""
+    """Load column names dynamically from SQL Server."""
     try:
         conn = pyodbc.connect(
             f"DRIVER={{ODBC Driver 18 for SQL Server}};"
             f"SERVER={os.getenv('SQL_SERVER')};"
             f"DATABASE={os.getenv('SQL_DATABASE')};"
             f"UID={os.getenv('SQL_USERNAME')};"
-            f"PWD={os.getenv('SQL_PASSWORD')};",
+            f"PWD={os.getenv('SQL_PASSWORD')};"
+            f"Encrypt=yes;"
+            f"TrustServerCertificate=yes;",
             timeout=5
         )
+
         cursor = conn.cursor()
         cursor.execute(f"""
             SELECT COLUMN_NAME
@@ -28,6 +34,8 @@ def load_sql_columns():
         """)
         columns = [row.COLUMN_NAME for row in cursor.fetchall()]
         conn.close()
+
+        print("🔍 Loaded SQL Columns:", columns)
         return columns
 
     except Exception as e:
@@ -35,83 +43,98 @@ def load_sql_columns():
         return []
 
 
-# ❗ DO NOT LOAD DURING IMPORT
+# Lazy-loaded global
 SQL_COLUMNS = []
 
 
 def get_sql_columns():
-    """Lazy-load columns when needed."""
     global SQL_COLUMNS
     if not SQL_COLUMNS:
         SQL_COLUMNS = load_sql_columns()
     return SQL_COLUMNS
 
 
+# --------------------------
+# GROQ CLIENT
+# --------------------------
 def get_client():
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise Exception("Missing GROQ_API_KEY")
+
     return Groq(api_key=api_key)
 
 
+# --------------------------
+# NLP HELPERS
+# --------------------------
 METRIC_SYNONYMS = {
     "revenue": "REVAmount",
-    "total revenue": "REVAmount",
     "sales": "REVAmount",
+    "total revenue": "REVAmount",
+    "rev": "REVAmount",
 
     "cost": "CSTAmount",
     "expense": "CSTAmount",
 
     "profit": "JobProfit",
+    "jobprofit": "JobProfit",
     "margin": "JobProfit"
 }
 
-TRANSPORT_KEYWORDS = ["SEA", "AIR", "ROAD", "RAIL", "COU", "FSA", "NOJ", "Unknown"]
+TRANSPORT_KEYWORDS = ["SEA", "AIR", "ROAD", "RAIL", "COU", "FSA", "NOJ", "UNKNOWN"]
 
 
+# --------------------------
+# LLM PARSER
+# --------------------------
 def extract_query(question):
-    client = get_client()
-    SQL_COLUMNS = get_sql_columns()
+    client = get_client()  # lazy load
+    SQL_COLUMNS = get_sql_columns()  # lazy load
 
     prompt = f"""
-You are a strict JSON generator.
+You are a JSON-only assistant.  
+Return ONLY valid JSON — no text outside JSON.
 
-ONLY output valid JSON.
+Use only these SQL columns:
+{SQL_COLUMNS}
 
-Use these SQL columns: {SQL_COLUMNS}
-
-Convert the question into JSON:
+Convert the user question into this JSON:
 {{
-  "metric": "<one column>",
-  "aggregation": "sum | avg | max | min | count",
+  "metric": "<one SQL column or null>",
+  "aggregation": "sum | avg | count | max | min",
   "year": 2024,
   "mode": "SEA"
 }}
 
 Rules:
-- If metric not found → "metric": null
-- If year not found → "year": null
-- If mode not found → "mode": null
+- If no metric found → "metric": null
+- If no year found → "year": null
+- If no mode found → "mode": null
 
 User Question: "{question}"
+JSON:
 """
 
     response = client.chat.completions.create(
         model="llama-3.1-8b-instant",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.0,
-        max_tokens=150
+        temperature=0,
+        max_tokens=120
     )
 
-    text = response.choices[0].message.content.strip()
+    raw = response.choices[0].message.content.strip()
+    print("\nRAW LLM JSON:\n", raw, "\n")
 
     # Safe parse
     try:
-        parsed = json.loads(text)
+        parsed = json.loads(raw)
     except:
         parsed = {"metric": None, "aggregation": "sum", "year": None, "mode": None}
 
-    # Fix metric using synonyms
+    # --------------------------
+    # FIX METRIC IF NULL
+    # --------------------------
     if not parsed.get("metric") or parsed["metric"] not in SQL_COLUMNS:
         q = question.lower()
         for k, col in METRIC_SYNONYMS.items():
@@ -119,7 +142,9 @@ User Question: "{question}"
                 parsed["metric"] = col
                 break
 
-    # Fix mode
+    # --------------------------
+    # FIX MODE
+    # --------------------------
     if not parsed.get("mode"):
         for m in TRANSPORT_KEYWORDS:
             if m.lower() in question.lower():
@@ -127,7 +152,7 @@ User Question: "{question}"
                 break
 
     # Final validation
-    if parsed["metric"] not in SQL_COLUMNS:
+    if parsed.get("metric") not in SQL_COLUMNS:
         parsed["metric"] = None
 
     return parsed
