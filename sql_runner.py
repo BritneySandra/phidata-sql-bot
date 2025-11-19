@@ -15,7 +15,7 @@ def run_sql(sql, params=None):
         f"DATABASE={os.getenv('SQL_DATABASE')};"
         f"UID={os.getenv('SQL_USERNAME')};"
         f"PWD={os.getenv('SQL_PASSWORD')};"
-        f"Encrypt=yes;"
+        f"Encrypt=no;"
         f"TrustServerCertificate=yes;"
     )
 

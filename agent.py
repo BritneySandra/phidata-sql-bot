@@ -21,9 +21,8 @@ def load_sql_columns():
             f"DATABASE={os.getenv('SQL_DATABASE')};"
             f"UID={os.getenv('SQL_USERNAME')};"
             f"PWD={os.getenv('SQL_PASSWORD')};"
-            f"Encrypt=yes;"
+            f"Encrypt=no;"
             f"TrustServerCertificate=yes;",
-            timeout=5
         )
 
         cursor = conn.cursor()
