@@ -1,8 +1,0 @@
-[phases.setup]
-aptPkgs = [
-  "unixodbc",
-  "unixodbc-dev",
-  "msodbcsql18",
-  "g++",
-  "build-essential"
-]
