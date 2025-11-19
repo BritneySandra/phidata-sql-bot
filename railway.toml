@@ -1,0 +1,5 @@
+[build]
+builder = "heroku/buildpacks:20"
+
+[build.buildpacks]
+HerokuPython = "heroku/python"
