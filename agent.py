@@ -11,30 +11,11 @@ load_dotenv()
 
 TABLE_NAME = "WBI_BI_Data_V2"
 
-# ---------------------------------------------------
-# Explicit categorical list (your confirmed list)
-# ---------------------------------------------------
-CATEGORICAL_COLUMNS = [
-    "TransportMode", "ContainerMode", "Direction",
-    "ProductLevel1", "ProductLevel2", "ProductLevel3",
-    "BranchCode", "AdjustedBranchCode",
-    "DeptCode",
-    "CustomerName", "CustomerGroup", "CustomerGroupName",
-    "CompanyCode",
-    "CountryName", "DestinationCountry", "OriginCountry",
-    "JobType",
-    "JobLevel1", "JobLevel2", "JobLevel3",
-    "Currency",
-    "Incoterm",
-    "BusinessType",
-    "ConsigneeImporterFullName",
-    "ConsignorShipperSuplierFullName",
-]
-
-# ---------------------------------------------------
-# Load schema: COLUMN_NAME -> DATA_TYPE
-# ---------------------------------------------------
+# --------------------------------
+# Load schema from SQL Server
+# --------------------------------
 def load_sql_schema():
+    """Read INFORMATION_SCHEMA for the target table."""
     try:
         conn = pyodbc.connect(
             f"DRIVER={{ODBC Driver 18 for SQL Server}};"
@@ -44,7 +25,7 @@ def load_sql_schema():
             f"PWD={os.getenv('SQL_PASSWORD')};"
             f"Encrypt=no;"
             f"TrustServerCertificate=yes;",
-            timeout=5,
+            timeout=5
         )
         cursor = conn.cursor()
         cursor.execute(
@@ -59,12 +40,9 @@ def load_sql_schema():
         return schema
     except Exception as e:
         print("⚠ SQL schema load failed:", e)
-        # fallback: best effort
-        return {c: "varchar" for c in CATEGORICAL_COLUMNS}
-
+        return {}
 
 _SCHEMA = {}
-
 
 def get_schema():
     global _SCHEMA
@@ -72,63 +50,42 @@ def get_schema():
         _SCHEMA = load_sql_schema()
     return _SCHEMA
 
-
-# ---------------------------------------------------
-# Numeric / metric helpers
-# ---------------------------------------------------
 def numeric_columns():
     schema = get_schema()
-    return [
-        c
-        for c, t in schema.items()
-        if t in ("decimal", "numeric", "money", "float", "int", "bigint", "smallint")
-    ]
+    return [c for c, t in schema.items() if t in ('decimal', 'numeric', 'money', 'float', 'int', 'bigint', 'smallint')]
 
+def categorical_columns():
+    """Treat everything that is not numeric/date as a dimension."""
+    schema = get_schema()
+    nums = set(numeric_columns())
+    cats = [c for c, t in schema.items()
+            if c not in nums and t not in ('date', 'datetime', 'smalldatetime', 'datetime2')]
+    return cats
 
-METRIC_SYNONYMS = {
-    # logical name  -> words the user might say
-    "REVAmount": ["revenue", "rev", "sales", "turnover", "income"],
-    "JobProfit": ["profit", "jobprofit", "margin", "earnings"],
-    "CSTAmount": ["cost", "cst", "expense", "spend"],
-}
-
-CATEGORY_SYNONYMS = {
-    "transport": ["TransportMode"],
-    "transportmode": ["TransportMode"],
-    "container": ["ContainerMode"],
-    "product": ["ProductLevel1", "ProductLevel2", "ProductLevel3"],
-    "department": ["DeptCode"],
-    "branch": ["BranchCode", "AdjustedBranchCode"],
-    "customer": ["CustomerName", "CustomerCode"],
-    "company": ["CompanyCode"],
-    "jobtype": ["JobType"],
-    "joblevel1": ["JobLevel1"],
-    "joblevel2": ["JobLevel2"],
-    "joblevel3": ["JobLevel3"],
-    "country": ["CountryName", "OriginCountry", "DestinationCountry"],
-}
-
-
-# ---------------------------------------------------
-# Time parsing helper  (year / quarter / month)
-# ---------------------------------------------------
+# --------------------------------
+# Time parsing helper
+# --------------------------------
 def parse_time_from_text(question: str):
+    """
+    Returns: {"year": int|None, "quarter": int|None, "month": int|None, "timeframe": str|None}
+    Resolves 'last year', 'last quarter', month names, etc. to explicit numbers.
+    """
     q = question.lower()
     now = datetime.utcnow()
     res = {"year": None, "quarter": None, "month": None, "timeframe": None}
 
     # explicit year like 2023, 2024
-    m = re.search(r"\b(20\d{2})\b", q)
+    m = re.search(r'\b(20\d{2})\b', q)
     if m:
         res["year"] = int(m.group(1))
 
-    # previous / last year
-    if "previous year" in q or "last year" in q:
+    # last / previous year
+    if 'previous year' in q or 'last year' in q:
         res["year"] = now.year - 1
         res["timeframe"] = "previous_year"
 
     # last / previous quarter
-    if "last quarter" in q or "previous quarter" in q:
+    if 'last quarter' in q or 'previous quarter' in q:
         current_q = (now.month - 1) // 3 + 1
         prev_q = current_q - 1
         prev_year = now.year
@@ -139,39 +96,26 @@ def parse_time_from_text(question: str):
         res["year"] = prev_year
         res["timeframe"] = "last_quarter"
 
-    # explicit quarter like Q1 2024 / quarter 3 2024
-    m = re.search(r"(?:q|quarter)[^\d]*([1-4])(?:[^0-9]+(20\d{2}))?", q)
+    # explicit quarter: Q1 2024, quarter 3 2023, etc.
+    m = re.search(r'(?:q|quarter)[^\d]*([1-4])(?:[^0-9]+(20\d{2}))?', q)
     if m:
         res["quarter"] = int(m.group(1))
         if m.group(2):
             res["year"] = int(m.group(2))
 
-    # last month / previous month
-    if "last month" in q or "previous month" in q:
+    # last / previous month
+    if 'last month' in q or 'previous month' in q:
         prev = now.replace(day=1) - timedelta(days=1)
         res["month"] = prev.month
         res["year"] = prev.year
         res["timeframe"] = "last_month"
 
-    # month name e.g. "march 2024"
+    # month name (march, aug 2024 etc.)
     months = {
-        m.lower(): i
-        for i, m in enumerate(
-            [
-                "",
-                "january",
-                "february",
-                "march",
-                "april",
-                "may",
-                "june",
-                "july",
-                "august",
-                "september",
-                "october",
-                "november",
-                "december",
-            ]
+        name.lower(): idx
+        for idx, name in enumerate(
+            ["", "january", "february", "march", "april", "may", "june",
+             "july", "august", "september", "october", "november", "december"]
         )
     }
     for name, idx in months.items():
@@ -183,377 +127,214 @@ def parse_time_from_text(question: str):
 
     return res
 
+# --------------------------------
+# Simple helpers for fallback
+# --------------------------------
+def detect_top_n(question: str):
+    """Find 'top 5', 'top 10', 'first 3' etc."""
+    q = question.lower()
+    m = re.search(r'top\s+(\d+)', q)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'first\s+(\d+)', q)
+    if m:
+        return int(m.group(1))
+    m = re.search(r'(\d+)\s+(?:customers|clients|branches|rows|records)', q)
+    if m:
+        return int(m.group(1))
+    return None
 
-# ---------------------------------------------------
-# Metric / category detection
-# ---------------------------------------------------
-def find_metric_from_text(question: str):
+def detect_metric(question: str):
     q = question.lower()
     schema = get_schema()
+    nums = numeric_columns()
 
-    # 1) explicit numeric column name
-    for col in numeric_columns():
+    # direct mention
+    for col in nums:
         if col.lower() in q:
             return col
 
-    # 2) synonyms
-    for col, syns in METRIC_SYNONYMS.items():
-        if col not in schema:
-            continue
-        for s in syns:
-            if s in q:
-                return col
+    # simple synonyms
+    if 'profit' in q and 'JobProfit' in schema:
+        return 'JobProfit'
+    if 'revenue' in q or 'sales' in q or 'turnover' in q:
+        if 'REVAmount' in schema:
+            return 'REVAmount'
 
-    # 3) heuristic fallbacks
-    if "profit" in q and "JobProfit" in schema:
-        return "JobProfit"
-    if "revenue" in q and "REVAmount" in schema:
-        return "REVAmount"
-
-    # 4) final fallback: first numeric column
-    nums = numeric_columns()
     return nums[0] if nums else None
 
-
-def find_category_from_text(question: str):
+def detect_group_column(question: str):
     q = question.lower()
-    schema = get_schema()
-
-    # direct column mention
-    for col in CATEGORICAL_COLUMNS:
-        if col.lower() in q and col in schema:
-            return col
-
-    # synonyms → real columns
-    for key, targets in CATEGORY_SYNONYMS.items():
-        if key in q:
-            for t in targets:
-                if t in schema:
-                    return t
-
-    # "by <something>" pattern
-    m = re.search(r"by\s+([a-z0-9 _-]{2,40})", q)
+    cats = categorical_columns()
+    # words after "by ..."
+    m = re.search(r'\bby\s+([a-z0-9 _-]{2,40})', q)
+    candidate = None
     if m:
         candidate = m.group(1).strip()
-        for col in CATEGORICAL_COLUMNS:
-            if candidate.replace(" ", "").lower() in col.lower() and col in schema:
+        candidate_nospace = candidate.replace(" ", "").lower()
+        for col in cats:
+            if candidate_nospace in col.lower():
                 return col
-
-    # fallback: transport
-    if "transport" in q and "TransportMode" in schema:
-        return "TransportMode"
-
+    # simple keywords
+    if 'transport' in q and 'TransportMode' in cats:
+        return 'TransportMode'
+    if 'product' in q and 'ProductLevel1' in cats:
+        return 'ProductLevel1'
+    if 'branch' in q and 'BranchCode' in cats:
+        return 'BranchCode'
+    if 'customer' in q and 'CustomerName' in cats:
+        return 'CustomerName'
     return None
 
-
-def extract_category_value(question: str, category_col: str):
-    """
-    Try to pull an actual value for the category (e.g. SEA, 'Air Export').
-    """
-    q = question
-
-    # 1) ALL CAPS codes like SEA, AIR, COU (but not years)
-    codes = re.findall(r"\b[A-Z]{2,6}\b", question)
-    if codes:
-        filtered = [c for c in codes if not re.match(r"\d{2,4}", c)]
-        if filtered:
-            return filtered[0]
-
-    # 2) Patterns around the category name
-    patterns = [
-        rf"{category_col.lower()}[^\w0-9]+([A-Za-z0-9 &\-/]+)",
-        rf"{category_col.lower().replace('_', ' ')}[^\w0-9]+([A-Za-z0-9 &\-/]+)",
-        r"for\s+([A-Za-z0-9 &\-/]+)\s+(?:in|on|for|$)",
-        r"for\s+the\s+([A-Za-z0-9 &\-/]+)\s",
-        r"([A-Za-z0-9 &\-/]+)\s+transport",
-    ]
-    for p in patterns:
-        m = re.search(p, q, re.IGNORECASE)
-        if m:
-            val = m.group(1).strip(" .,:;\"'")
-            val = re.sub(
-                r"\b(20\d{2}|last|previous|quarter|q[1-4]|in)\b.*$",
-                "",
-                val,
-                flags=re.IGNORECASE,
-            ).strip()
-            if val:
-                return val
-
-    # 3) quoted phrases
-    m = re.search(r"['\"]([^'\"]{2,60})['\"]", q)
-    if m:
-        return m.group(1)
-
-    return None
-
-
-# ---------------------------------------------------
-# Groq client (optional, improves parsing)
-# ---------------------------------------------------
+# --------------------------------
+# Groq client
+# --------------------------------
 def get_client():
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         return None
     return Groq(api_key=api_key)
 
-
-# ---------------------------------------------------
-# MAIN: question -> generic INTENT JSON
-# ---------------------------------------------------
-def extract_query(question: str) -> dict:
+# --------------------------------
+# Main: question -> generic JSON plan
+# --------------------------------
+def extract_query(question: str):
     """
-    Returns a general-purpose 'intent' that sql_builder.py will convert to SQL.
+    Returns a *generic* query plan (not tied to cases):
 
-    Structure:
     {
       "select": [
-         {"column": "JobProfit", "aggregation": "sum", "alias": "value"}
+        {"column": "JobProfit", "aggregation": "sum", "alias": "value"}
       ],
       "filters": [
-         {"column": "FinancialYear", "operator": "=", "value": 2024},
-         {"column": "TransportMode", "operator": "in", "value": ["SEA","AIR"]}
+        {"column": "FinancialYear", "operator": "=", "value": 2024},
+        {"column": "TransportMode", "operator": "in", "value": ["SEA","AIR"]}
       ],
       "group_by": ["TransportMode"],
       "order_by": [{"column": "value", "direction": "desc"}],
-      "top": 5
+      "limit": 5
     }
     """
-
     schema = get_schema()
-    q_lower = question.lower()
+    nums = numeric_columns()
+    cats = categorical_columns()
+    time_ctx = parse_time_from_text(question)
 
-    # ---- metric, agg, time ----
-    metric = find_metric_from_text(question)
-    time = parse_time_from_text(question)
+    # --------------------
+    # 1. Default / fallback plan
+    # --------------------
+    metric = detect_metric(question)
+    if not metric:
+        metric = nums[0] if nums else None
 
-    # aggregation
     agg = "sum"
+    q_lower = question.lower()
     if any(w in q_lower for w in ["average", "avg", "mean"]):
         agg = "avg"
     if any(w in q_lower for w in ["count", "how many", "number of"]):
         agg = "count"
-    if any(w in q_lower for w in ["max", "maximum", "largest", "highest"]):
+    if any(w in q_lower for w in ["max", "maximum", "highest", "largest"]):
         agg = "max"
-    if any(w in q_lower for w in ["min", "minimum", "smallest", "lowest"]):
+    if any(w in q_lower for w in ["min", "minimum", "lowest", "smallest"]):
         agg = "min"
 
-    # ---- category & grouping ----
-    category_col = find_category_from_text(question)
-    category_value = None
+    group_col = detect_group_column(question)
+    top_n = detect_top_n(question)
 
-    if category_col:
-        category_value = extract_category_value(question, category_col)
-        if category_value and re.fullmatch(r"[A-Za-z]{2,6}", category_value.strip()):
-            category_value = category_value.strip().upper()
-        elif category_value:
-            category_value = category_value.strip()
-
-    # group-by intent
-    group_by_cols = []
-    group_words = [
-        " by ",
-        " breakdown",
-        " group ",
-        " split ",
-        " per ",
-        " distribution",
-        " across ",
-    ]
-    has_group_word = any(w in q_lower for w in group_words)
-
-    if category_col and has_group_word and not category_value:
-        # e.g. "revenue by transport mode"
-        group_by_cols = [category_col]
-
-    # ---- compare values (for IN filter) ----
-    compare_values = []
-    if "compare" in q_lower or " vs " in q_lower or " versus " in q_lower:
-        parts = re.split(r"compare|versus| vs | vs\.|,| and | & ", question, flags=re.IGNORECASE)
-        for part in parts[1:]:
-            tokens = re.findall(r"[A-Za-z0-9 &\-/]{1,40}", part)
-            for t in tokens:
-                t = t.strip()
-                if t and not re.search(
-                    r"\b(last|previous|year|quarter|q[1-4])\b", t, re.IGNORECASE
-                ):
-                    compare_values.append(t)
-        compare_values = [c for i, c in enumerate(compare_values) if c and c not in compare_values[:i]]
-
-    # ---- top / bottom N ----
-    top_n = None
-    order_direction = None
-
-    m_top = re.search(r"\btop\s+(\d+)\b", q_lower)
-    m_bottom = re.search(r"\bbottom\s+(\d+)\b", q_lower)
-
-    if m_top:
-        top_n = int(m_top.group(1))
-        order_direction = "desc"
-    elif m_bottom:
-        top_n = int(m_bottom.group(1))
-        order_direction = "asc"
-
-    # ---- build filters list ----
-    filters = []
-
-    if time.get("year") is not None:
-        filters.append(
-            {"column": "FinancialYear", "operator": "=", "value": time["year"]}
-        )
-    if time.get("quarter") is not None:
-        filters.append(
-            {
-                "column": "FinancialQuarter",
-                "operator": "=",
-                "value": time["quarter"],
-            }
-        )
-    if time.get("month") is not None:
-        filters.append(
-            {"column": "FinancialMonth", "operator": "=", "value": time["month"]}
-        )
-
-    if category_col and category_value:
-        filters.append(
-            {
-                "column": category_col,
-                "operator": "=",
-                "value": category_value,
-            }
-        )
-    elif category_col and compare_values:
-        filters.append(
-            {
-                "column": category_col,
-                "operator": "in",
-                "value": compare_values,
-            }
-        )
-
-    # ---- ORDER BY ----
-    order_by = []
-    if metric:
-        metric_alias = "value"
-        if group_by_cols:
-            direction = order_direction or ("desc" if agg in ("sum", "avg", "max") else "asc")
-            order_by.append({"column": metric_alias, "direction": direction})
-
-    # ---- SELECT list ----
-    select = []
-    if metric:
-        select.append(
-            {"column": metric, "aggregation": agg, "alias": "value"}
-        )
-
-    base_intent = {
-        "select": select,
-        "filters": filters,
-        "group_by": group_by_cols,
-        "order_by": order_by,
-        "top": top_n,
+    base_plan = {
+        "select": [{"column": metric, "aggregation": agg, "alias": "value"}] if metric else [],
+        "filters": [],
+        "group_by": [group_col] if group_col else [],
+        "order_by": [],
+        "limit": top_n
     }
 
-    # ------------------------------------------------
-    # Optional: ask Groq to refine / fix the intent
-    # ------------------------------------------------
+    # --------------------
+    # 2. Try Groq to refine the plan
+    # --------------------
     client = get_client()
-    if not client:
-        return base_intent
+    if client and metric:
+        try:
+            prompt = f"""
+You are a senior analytics engineer.
 
-    try:
-        prompt = f"""
-You are a JSON-only assistant.
+Convert the user's question into a JSON description of a SQL query.
 
-You are given a list of SQL columns:
-{list(schema.keys())}
+USE ONLY these columns:
+NUMERIC_COLUMNS = {nums}
+CATEGORICAL_COLUMNS = {cats}
 
-Convert the user question into this JSON format:
-
+JSON format (no extra text):
 {{
   "select": [
     {{"column": "<numeric column>", "aggregation": "sum|avg|max|min|count", "alias": "value"}}
   ],
   "filters": [
-    {{"column": "<column>", "operator": "=|>|<|>=|<=|<>|in|between", "value": <value or [values]>}}
+    {{"column": "<column>", "operator": "=|!=|>|<|>=|<=|in|between|like", "value": "<scalar or list>"}}
   ],
-  "group_by": ["<column>", "..."],
-  "order_by": [
-    {{"column": "<column or alias>", "direction": "asc|desc"}}
-  ],
-  "top": <integer or null>
+  "group_by": ["<dimension columns>"],
+  "order_by": [{{"column": "<column or alias>", "direction": "asc|desc"}}],
+  "limit": <integer or null>
 }}
 
-Rules:
-- Use only column names that exist in the provided list.
-- If the user says "top N", set "top" to N and sort by the aggregated metric alias "value" desc.
-- If the user filters by a category value (e.g. SEA, Air Export), use a filter with operator "=".
-- If the user compares values (SEA vs AIR), use operator "in" with a list of values.
-- If no specific time is mentioned, leave time filters out.
+Guidelines:
+- ALWAYS use only columns from the lists above.
+- If the user says "top 5" or similar, set "limit" to that integer.
+- If user asks "by transport mode / by customer / by branch", add that column to group_by.
+- For a single overall total, leave group_by empty.
+- If unsure about filters, leave "filters" empty (they will be added later).
 
-User question: "{question}"
+User question:
+\"\"\"{question}\"\"\"
 
-Return ONLY JSON. No extra text.
+Return ONLY valid JSON.
 """
-        resp = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_tokens=300,
-        )
-        raw = resp.choices[0].message.content.strip()
-        llm_intent = json.loads(raw)
+            resp = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=256
+            )
+            raw = resp.choices[0].message.content.strip()
+            llm_plan = json.loads(raw)
 
-        # ------ merge LLM intent on top of base_intent, with validation ------
-        intent = base_intent
+            # Merge LLM plan over fallback
+            if isinstance(llm_plan, dict):
+                base_plan.update({k: v for k, v in llm_plan.items() if v not in (None, "", [])})
+        except Exception as e:
+            print("Groq plan generation failed, using fallback:", e)
 
-        # select
-        sel = llm_intent.get("select")
-        if isinstance(sel, list) and sel:
-            clean_sel = []
-            for s in sel:
-                col = s.get("column")
-                if col and col in schema and col in numeric_columns():
-                    clean_sel.append(
-                        {
-                            "column": col,
-                            "aggregation": s.get("aggregation", "sum"),
-                            "alias": s.get("alias", "value"),
-                        }
-                    )
-            if clean_sel:
-                intent["select"] = clean_sel
+    plan = base_plan
 
-        # filters
-        llm_filters = llm_intent.get("filters") or []
-        clean_filters = []
-        for f in llm_filters:
-            col = f.get("column")
-            if col and col in schema:
-                clean_filters.append(f)
-        if clean_filters:
-            intent["filters"] = clean_filters
+    # --------------------
+    # 3. Inject time filters (our logic overrides any LLM mistakes)
+    # --------------------
+    filters = plan.get("filters") or []
+    # Drop any time filters the LLM might have tried to guess
+    filters = [
+        f for f in filters
+        if f.get("column") not in ("FinancialYear", "FinancialQuarter", "FinancialMonth")
+    ]
 
-        # group_by
-        llm_group = llm_intent.get("group_by") or []
-        clean_group = [c for c in llm_group if c in schema]
-        if clean_group:
-            intent["group_by"] = clean_group
+    if time_ctx.get("year"):
+        filters.append({"column": "FinancialYear", "operator": "=", "value": time_ctx["year"]})
+    if time_ctx.get("quarter"):
+        filters.append({"column": "FinancialQuarter", "operator": "=", "value": time_ctx["quarter"]})
+    if time_ctx.get("month"):
+        filters.append({"column": "FinancialMonth", "operator": "=", "value": time_ctx["month"]})
 
-        # order_by
-        llm_order = llm_intent.get("order_by") or []
-        if llm_order:
-            intent["order_by"] = llm_order
+    plan["filters"] = filters
 
-        # top
-        if llm_intent.get("top") is not None:
-            try:
-                intent["top"] = int(llm_intent["top"])
-            except Exception:
-                pass
+    # Ensure select exists
+    if not plan.get("select"):
+        if metric:
+            plan["select"] = [{"column": metric, "aggregation": agg, "alias": "value"}]
 
-        return intent
+    # Ensure limit is int or None
+    limit = plan.get("limit")
+    if isinstance(limit, str) and limit.isdigit():
+        plan["limit"] = int(limit)
+    if not isinstance(plan.get("limit"), int):
+        plan["limit"] = None
 
-    except Exception as e:
-        print("LLM intent parse failed:", e)
-        return base_intent
+    return plan

@@ -4,9 +4,9 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from agent import extract_query
-from sql_builder import build_sql
-from sql_runner import run_sql  # your existing DB executor
+from agent import extract_query, get_schema
+from sql_builder import build_sql_from_plan
+from sql_runner import run_sql
 
 app = FastAPI()
 
@@ -21,20 +21,17 @@ app.add_middleware(
 
 TABLE = "WBI_BI_Data_V2"
 
-
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "API running"}
-
 
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
 
-
-# ------------------------------------------------------
-# Dark-mode ChatGPT-style UI (works in browser + Power BI)
-# ------------------------------------------------------
+# -------------------------------
+# Dark-mode ChatGPT-style UI
+# -------------------------------
 @app.get("/chat", response_class=HTMLResponse)
 async def chat_ui():
     return """
@@ -50,26 +47,17 @@ body {
     margin: 0;
     padding: 20px;
 }
-#chat-container {
-    max-width: 900px;
-    margin: auto;
-}
-h2 {
-    color: #58a6ff;
-    margin-bottom: 20px;
-}
+#chat-container { max-width: 900px; margin: auto; }
+h2 { color: #58a6ff; margin-bottom: 20px; }
 #q {
-    width: 80%;
-    padding: 12px;
+    width: 80%; padding: 12px;
     border-radius: 6px;
     border: 1px solid #30363d;
     background: #161b22;
     color: white;
     outline: none;
 }
-#q::placeholder {
-    color: #8b949e;
-}
+#q::placeholder { color: #8b949e; }
 button {
     padding: 12px 20px;
     background: #238636;
@@ -78,9 +66,7 @@ button {
     border-radius: 6px;
     cursor: pointer;
 }
-button:hover {
-    background: #2ea043;
-}
+button:hover { background: #2ea043; }
 .chat-box {
     background: #161b22;
     border: 1px solid #30363d;
@@ -114,6 +100,7 @@ button:hover {
 <script>
 async function ask() {
     let q = document.getElementById("q").value;
+    if (!q) return;
     document.getElementById("a").innerHTML = "<i>Thinking...</i>";
 
     let res = await fetch('/ask', {
@@ -121,32 +108,24 @@ async function ask() {
         headers: {'Content-Type':'application/json'},
         body: JSON.stringify({question: q})
     });
-
     let data = await res.json();
 
-    let html = "<b>SQL:</b><br>" + (data.sql || "(no SQL)") + "<br><br>";
+    let html = "<b>SQL:</b><br>" + (data.sql || "(none)") + "<br><br>";
 
-    if (data.rows && data.rows.length > 0) {
+    if (data.rows && data.rows.length > 0 && data.columns) {
         html += "<b>Result:</b><br>";
-        html += "<table class='result-table'>";
-
-        if (data.columns && data.columns.length) {
-            html += "<tr>";
-            data.columns.forEach(c => html += "<th>" + c + "</th>");
-            html += "</tr>";
-        }
-
+        html += "<table class='result-table'><tr>";
+        data.columns.forEach(c => html += "<th>" + c + "</th>");
+        html += "</tr>";
         data.rows.forEach(r => {
             html += "<tr>";
-            Object.values(r).forEach(v => html += "<td>" + v + "</td>");
+            data.columns.forEach(c => html += "<td>" + (r[c] ?? '') + "</td>");
             html += "</tr>";
         });
-
         html += "</table>";
     } else {
-        html += "<b>Answer:</b><br>" + (data.result || "No data found");
+        html += "<b>Answer:</b><br>" + (data.result || "No data");
     }
-
     document.getElementById("a").innerHTML = html;
 }
 </script>
@@ -154,52 +133,47 @@ async function ask() {
 </html>
     """
 
-
 class Query(BaseModel):
     question: str
 
-
 @app.post("/ask")
 async def ask(q: Query):
-    # 1) Use agent to convert question -> generic intent
-    intent = extract_query(q.question)
+    schema = get_schema()
 
-    if not intent.get("select"):
-        return JSONResponse(
-            {"sql": None, "result": "I couldn't understand which measure to use."},
-            status_code=200,
-        )
-
-    # 2) Build SQL from intent
-    sql, params = build_sql(intent, TABLE)
-
-    # 3) Execute SQL
     try:
-        rows = run_sql(sql, params or [])
+        # 1) question -> JSON plan
+        plan = extract_query(q.question)
+
+        # 2) plan -> SQL + params
+        sql, params, columns = build_sql_from_plan(plan, TABLE, schema)
+
+        # 3) execute
+        rows = run_sql(sql, params)
+
+        if not rows:
+            return {"sql": sql, "result": "No data found", "rows": [], "columns": columns}
+
+        # Simple human text summary
+        if len(rows) == 1 and len(columns) == 1:
+            val = rows[0][columns[0]]
+            try:
+                val_fmt = f"{val:,}"
+            except Exception:
+                val_fmt = str(val)
+            summary = f"{columns[0]} = {val_fmt}"
+        else:
+            summary = f"{len(rows)} rows returned."
+
+        return {"sql": sql, "result": summary, "rows": rows, "columns": columns}
+
     except Exception as e:
+        # Catch any error (bad plan, SQL error, etc.)
         return JSONResponse(
-            {"sql": sql, "result": f"SQL execution error: {e}", "rows": []},
             status_code=200,
+            content={
+                "sql": locals().get("sql", None),
+                "result": f"SQL execution error: {e}",
+                "rows": [],
+                "columns": []
+            }
         )
-
-    if not rows:
-        return {"sql": sql, "result": "No data found", "rows": []}
-
-    # columns for UI table
-    columns = list(rows[0].keys())
-
-    # human-friendly summary for single scalar
-    if len(rows) == 1 and len(columns) == 1:
-        val = rows[0][columns[0]]
-        result_text = f"{columns[0]} = {val:,}" if isinstance(val, (int, float)) else str(
-            val
-        )
-    else:
-        result_text = f"{len(rows)} rows"
-
-    return {
-        "sql": sql,
-        "columns": columns,
-        "rows": rows,
-        "result": result_text,
-    }
