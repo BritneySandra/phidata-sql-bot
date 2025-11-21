@@ -1,127 +1,116 @@
 # sql_builder.py
-from typing import Dict, Any, List, Tuple
+from typing import Tuple, List, Any, Dict
 
 
-def build_sql(plan: Dict[str, Any], table_name: str) -> Tuple[str, List[Any]]:
+def build_sql(intent: Dict, table: str) -> Tuple[str, List[Any]]:
     """
-    Build a SQL Server query from a generic JSON plan.
+    Convert generic intent into parameterised SQL + params list.
 
-    plan format (Option B):
+    intent =
     {
       "select": [
-        {"column": "JobProfit", "aggregation": "sum"},
-        {"column": "REVAmount", "aggregation": "avg"}
+        {"column": "JobProfit", "aggregation": "sum", "alias": "value"}
       ],
       "filters": [
         {"column": "FinancialYear", "operator": "=", "value": 2024},
         {"column": "TransportMode", "operator": "in", "value": ["SEA", "AIR"]}
       ],
       "group_by": ["TransportMode"],
-      "order_by": [
-        {"column": "JobProfit", "direction": "desc"}
-      ],
-      "limit": 50
+      "order_by": [{"column": "value", "direction": "desc"}],
+      "top": 5
     }
     """
 
-    select_items = plan.get("select") or []
-    filters = plan.get("filters") or []
-    group_by = plan.get("group_by") or []
-    order_by = plan.get("order_by") or []
-    limit = plan.get("limit")
+    select_items = intent.get("select") or []
+    filters = intent.get("filters") or []
+    group_by_cols = intent.get("group_by") or []
+    order_by_spec = intent.get("order_by") or []
+    top_n = intent.get("top")
 
     params: List[Any] = []
+
+    # ---------------- SELECT ----------------
     select_clauses: List[str] = []
 
-    # --- GROUP BY columns must appear in SELECT ---
-    if isinstance(group_by, str):
-        group_by = [group_by]
-    group_by = group_by or []
-
-    for col in group_by:
+    # Group-by columns first (dimensions)
+    for col in group_by_cols:
         select_clauses.append(f"[{col}]")
 
-    # --- SELECT metrics ---
-    for item in select_items:
-        col = item.get("column")
-        agg = (item.get("aggregation") or "").lower()
-        if not col:
-            continue
-
-        if agg in ("sum", "avg", "max", "min", "count"):
-            alias = f"{agg}_{col}"
-            select_clauses.append(f"{agg.upper()}([{col}]) AS [{alias}]")
-        else:
-            # no aggregation, include raw column (only if not already present)
-            if col not in group_by:
-                select_clauses.append(f"[{col}]")
+    # Aggregated metrics
+    for s in select_items:
+        col = s.get("column")
+        agg = (s.get("aggregation") or "").upper()
+        alias = s.get("alias") or (f"{agg}_{col}" if agg else col)
+        if agg:
+            select_clauses.append(f"{agg}([{col}]) AS [{alias}]")
+        elif col:
+            select_clauses.append(f"[{col}] AS [{alias}]")
 
     if not select_clauses:
-        # absolute fallback if LLM gave nothing: count rows
-        select_clauses.append("COUNT(*) AS [row_count]")
+        select_clauses.append("*")
 
-    select_sql = ", ".join(select_clauses)
+    top_clause = f"TOP {int(top_n)} " if top_n else ""
 
-    # --- WHERE ---
-    where_clauses: List[str] = []
-    for f in filters:
-        col = f.get("column")
-        op = (f.get("operator") or "=").lower()
-        val = f.get("value")
+    sql = f"SELECT {top_clause}" + ", ".join(select_clauses) + f" FROM {table}"
 
-        if not col:
-            continue
+    # ---------------- WHERE ----------------
+    if filters:
+        where_parts: List[str] = []
+        for f in filters:
+            col = f.get("column")
+            op = (f.get("operator") or "=").lower()
+            val = f.get("value")
 
-        if op == "in" and isinstance(val, list):
-            if not val:
+            if not col:
                 continue
-            placeholders = ",".join("?" for _ in val)
-            where_clauses.append(f"[{col}] IN ({placeholders})")
-            params.extend(val)
 
-        elif op == "between" and isinstance(val, list) and len(val) == 2:
-            where_clauses.append(f"[{col}] BETWEEN ? AND ?")
-            params.extend(val)
+            if op == "in" and isinstance(val, (list, tuple)):
+                placeholders = ", ".join(["?"] * len(val))
+                where_parts.append(f"[{col}] IN ({placeholders})")
+                params.extend(val)
 
-        elif op == "like":
-            where_clauses.append(f"[{col}] LIKE ?")
-            params.append(val)
+            elif op == "between" and isinstance(val, (list, tuple)) and len(val) == 2:
+                where_parts.append(f"[{col}] BETWEEN ? AND ?")
+                params.extend([val[0], val[1]])
 
-        else:
-            if op not in ("=", "!=", "<", ">", "<=", ">="):
-                op = "="
-            where_clauses.append(f"[{col}] {op} ?")
-            params.append(val)
+            elif op in ("contains", "like"):
+                where_parts.append(f"[{col}] LIKE ?")
+                params.append(f"%{val}%")
 
-    where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
+            elif op == "startswith":
+                where_parts.append(f"[{col}] LIKE ?")
+                params.append(f"{val}%")
 
-    # --- GROUP BY ---
-    group_sql = ""
-    if group_by:
-        gb_cols = ", ".join(f"[{c}]" for c in group_by)
-        group_sql = f" GROUP BY {gb_cols}"
+            elif op == "endswith":
+                where_parts.append(f"[{col}] LIKE ?")
+                params.append(f"%{val}")
 
-    # --- ORDER BY ---
-    order_sql = ""
-    if order_by:
-        if isinstance(order_by, dict):
-            order_by = [order_by]
-        order_clauses: List[str] = []
-        for ob in order_by:
+            else:
+                where_parts.append(f"[{col}] {op.upper()} ?")
+                params.append(val)
+
+        if where_parts:
+            sql += " WHERE " + " AND ".join(where_parts)
+
+    # ---------------- GROUP BY ----------------
+    if group_by_cols:
+        group_list = ", ".join(f"[{c}]" for c in group_by_cols)
+        sql += f" GROUP BY {group_list}"
+
+    # ---------------- ORDER BY ----------------
+    if order_by_spec:
+        ob_list: List[str] = []
+        for ob in order_by_spec:
             col = ob.get("column")
             if not col:
                 continue
-            direction = (ob.get("direction") or "asc").lower()
-            dir_sql = "DESC" if direction in ("desc", "descending") else "ASC"
-            order_clauses.append(f"[{col}] {dir_sql}")
-        if order_clauses:
-            order_sql = " ORDER BY " + ", ".join(order_clauses)
+            direction = (ob.get("direction") or "DESC").upper()
+            # allow both aliases and columns
+            ob_list.append(f"[{col}]" if col[0].isalpha() and col[0].isupper() else f"{col} {direction}")
+            # but simpler & safe:
+            ob_list[-1] = f"{col} {direction}"
 
-    # --- LIMIT (SQL Server uses TOP) ---
-    top_prefix = ""
-    if isinstance(limit, int) and limit > 0:
-        top_prefix = f"TOP {limit} "
-
-    sql = f"SELECT {top_prefix}{select_sql} FROM {table_name} WHERE {where_sql}{group_sql}{order_sql};"
+        if ob_list:
+            sql += " ORDER BY " + ", ".join(ob_list)
 
     return sql, params

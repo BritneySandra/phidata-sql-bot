@@ -3,8 +3,10 @@ from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from agent import extract_query, get_schema
-from sql_runner import run_sql
+
+from agent import extract_query
+from sql_builder import build_sql
+from sql_runner import run_sql  # your existing DB executor
 
 app = FastAPI()
 
@@ -19,18 +21,20 @@ app.add_middleware(
 
 TABLE = "WBI_BI_Data_V2"
 
+
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "API running"}
+
 
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
 
 
-# ---------------------------------------------------------------------
-# DARK MODE CHATGPT UI
-# ---------------------------------------------------------------------
+# ------------------------------------------------------
+# Dark-mode ChatGPT-style UI (works in browser + Power BI)
+# ------------------------------------------------------
 @app.get("/chat", response_class=HTMLResponse)
 async def chat_ui():
     return """
@@ -38,7 +42,6 @@ async def chat_ui():
 <html>
 <head>
 <title>PhiData SQL Chatbot</title>
-
 <style>
 body {
     background-color: #0d1117;
@@ -99,15 +102,12 @@ button:hover {
     background: #0d1117;
 }
 </style>
-
 </head>
 <body>
 <div id="chat-container">
     <h2>PhiData SQL Chatbot</h2>
-
     <input id="q" placeholder="Ask any question...">
     <button onclick="ask()">Send</button>
-
     <div id="a" class="chat-box"></div>
 </div>
 
@@ -124,13 +124,13 @@ async function ask() {
 
     let data = await res.json();
 
-    let html = "<b>SQL:</b><br>" + data.sql + "<br><br>";
+    let html = "<b>SQL:</b><br>" + (data.sql || "(no SQL)") + "<br><br>";
 
-    if (data.rows) {
+    if (data.rows && data.rows.length > 0) {
         html += "<b>Result:</b><br>";
         html += "<table class='result-table'>";
 
-        if (data.columns) {
+        if (data.columns && data.columns.length) {
             html += "<tr>";
             data.columns.forEach(c => html += "<th>" + c + "</th>");
             html += "</tr>";
@@ -144,13 +144,12 @@ async function ask() {
 
         html += "</table>";
     } else {
-        html += "<b>Answer:</b><br>" + data.result;
+        html += "<b>Answer:</b><br>" + (data.result || "No data found");
     }
 
     document.getElementById("a").innerHTML = html;
 }
 </script>
-
 </body>
 </html>
     """
@@ -160,104 +159,47 @@ class Query(BaseModel):
     question: str
 
 
-# ---------------------------------------------------------------------
-# ASK ENDPOINT (AUTO SQL BUILDER)
-# ---------------------------------------------------------------------
 @app.post("/ask")
 async def ask(q: Query):
-    parsed = extract_query(q.question)
+    # 1) Use agent to convert question -> generic intent
+    intent = extract_query(q.question)
 
-    metric = parsed.get("metric")
-    agg = parsed.get("aggregation", "sum")
-    time = parsed.get("time", {})
-    group_by = parsed.get("group_by", False)
-    group_col = parsed.get("group_column")
-    category_value = parsed.get("category_value")
-    compare = parsed.get("compare", [])
+    if not intent.get("select"):
+        return JSONResponse(
+            {"sql": None, "result": "I couldn't understand which measure to use."},
+            status_code=200,
+        )
 
-    schema = get_schema()
+    # 2) Build SQL from intent
+    sql, params = build_sql(intent, TABLE)
 
-    if not metric or metric not in schema:
-        return JSONResponse({
-            "sql": None,
-            "result": "❌ Unknown metric (I couldn't find a numeric column)."
-        })
+    # 3) Execute SQL
+    try:
+        rows = run_sql(sql, params or [])
+    except Exception as e:
+        return JSONResponse(
+            {"sql": sql, "result": f"SQL execution error: {e}", "rows": []},
+            status_code=200,
+        )
 
-    # WHERE clause
-    where = []
-    params = []
+    if not rows:
+        return {"sql": sql, "result": "No data found", "rows": []}
 
-    if time.get("year"):
-        where.append("FinancialYear = ?")
-        params.append(time["year"])
-    if time.get("quarter"):
-        where.append("FinancialQuarter = ?")
-        params.append(time["quarter"])
-    if time.get("month"):
-        where.append("FinancialMonth = ?")
-        params.append(time["month"])
+    # columns for UI table
+    columns = list(rows[0].keys())
 
-    if group_col and category_value:
-        where.append(f"{group_col} = ?")
-        params.append(category_value)
+    # human-friendly summary for single scalar
+    if len(rows) == 1 and len(columns) == 1:
+        val = rows[0][columns[0]]
+        result_text = f"{columns[0]} = {val:,}" if isinstance(val, (int, float)) else str(
+            val
+        )
+    else:
+        result_text = f"{len(rows)} rows"
 
-    where_clause = " AND ".join(where) if where else "1=1"
-
-    # Aggregations
-    agg_map = {"sum": "SUM", "avg": "AVG", "max": "MAX", "min": "MIN", "count": "COUNT"}
-    agg_sql = agg_map.get(agg, "SUM")
-
-    # GROUP BY full breakdown
-    if group_by and group_col and not category_value and not compare:
-        sql = f"""
-            SELECT {group_col} AS category, {agg_sql}([{metric}]) AS value
-            FROM {TABLE}
-            WHERE {where_clause}
-            GROUP BY {group_col}
-            ORDER BY value DESC
-        """
-        rows = run_sql(sql, params)
-        return {"sql": sql, "columns": ["category", "value"], "rows": rows}
-
-    # CATEGORY COMPARISON
-    if compare and group_col:
-        placeholders = ",".join("?" for _ in compare)
-        extra = f"{group_col} IN ({placeholders})"
-        where_plus = f"{where_clause} AND {extra}" if where_clause != "1=1" else extra
-
-        sql = f"""
-            SELECT {group_col} AS category, {agg_sql}([{metric}]) AS value
-            FROM {TABLE}
-            WHERE {where_plus}
-            GROUP BY {group_col}
-            ORDER BY value DESC
-        """
-        rows = run_sql(sql, params + compare)
-        return {"sql": sql, "columns": [group_col, "value"], "rows": rows}
-
-    # SINGLE CATEGORY VALUE
-    if group_col and category_value:
-        sql = f"""
-            SELECT {agg_sql}([{metric}]) AS value
-            FROM {TABLE}
-            WHERE {where_clause}
-        """
-        rows = run_sql(sql, params)
-        value = rows[0]["value"] if rows else None
-        if value is None:
-            return {"sql": sql, "result": "No data found"}
-        return {"sql": sql, "result": f"{metric} for {category_value} = {value:,}"}
-
-    # DEFAULT simple aggregate
-    sql = f"""
-        SELECT {agg_sql}([{metric}]) AS value
-        FROM {TABLE}
-        WHERE {where_clause}
-    """
-    rows = run_sql(sql, params)
-    value = rows[0]["value"] if rows else None
-
-    if value is None:
-        return {"sql": sql, "result": "No data found"}
-
-    return {"sql": sql, "result": f"{agg} of {metric} is {value:,}"}
+    return {
+        "sql": sql,
+        "columns": columns,
+        "rows": rows,
+        "result": result_text,
+    }
