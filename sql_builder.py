@@ -1,123 +1,108 @@
 # sql_builder.py
-from typing import Tuple, List, Dict, Any
 
-def build_sql_from_plan(
-    plan: Dict[str, Any],
-    table: str,
-    schema: Dict[str, str]
-) -> Tuple[str, List[Any], List[str]]:
+def build_sql_from_plan(plan, table_name, schema):
     """
-    Convert a generic plan from agent.extract_query into:
-      - SQL text with parameter placeholders
-      - list of parameter values
-      - list of output column aliases (for table rendering)
+    Convert the generic JSON plan into an executable SQL + parameter list.
+
+    Supports:
+    - Business metric expressions (e.g. REVAmount + WIPAmount)
+    - Normal column aggregates
+    - WHERE filters
+    - GROUP BY
+    - ORDER BY
+    - LIMIT / TOP
     """
 
-    selects = plan.get("select") or []
-    filters = plan.get("filters") or []
-    group_by = plan.get("group_by") or []
-    order_by = plan.get("order_by") or []
-    limit = plan.get("limit")
+    selects = plan.get("select", [])
+    filters = plan.get("filters", [])
+    group_by = plan.get("group_by", [])
+    order_by = plan.get("order_by", [])
+    limit = plan.get("limit", None)
 
-    if not selects:
-        raise ValueError("No valid select expressions in plan")
+    sql_select_parts = []
+    columns_out = []
 
-    select_sql_parts: List[str] = []
-    params: List[Any] = []
-    output_columns: List[str] = []
+    # ---------------------------------------------------
+    # SELECT clause
+    # ---------------------------------------------------
+    for sel in selects:
+        col = sel.get("column")
+        expr = sel.get("expression")
+        agg = sel.get("aggregation", "sum").upper()
+        alias = sel.get("alias", "value")
 
-    # -------- SELECT --------
-    for s in selects:
-        if not isinstance(s, dict):
-            continue
-        col = s.get("column")
-        expr = s.get("expression")
-        agg = (s.get("aggregation") or "sum").upper()
-        alias = s.get("alias") or (col or "value")
-
-        if expr:
-            inner = expr  # already proper SQL expression (e.g. [REVAmount] + [WIPAmount])
-        elif col:
-            inner = f"[{col}]"
+        if expr:  
+            # Business metric expression
+            sql_select_parts.append(f"{agg}({expr}) AS [{alias}]")
+            columns_out.append(alias)
         else:
-            continue
+            # Normal column
+            sql_select_parts.append(f"{agg}([{col}]) AS [{alias}]")
+            columns_out.append(alias)
 
-        if agg in ("SUM", "AVG", "MAX", "MIN", "COUNT"):
-            select_piece = f"{agg}({inner}) AS [{alias}]"
-        else:
-            # no aggregation (rare)
-            select_piece = f"{inner} AS [{alias}]"
+    if not sql_select_parts:
+        raise Exception("No valid select expressions in plan")
 
-        select_sql_parts.append(select_piece)
-        output_columns.append(alias)
+    select_sql = ", ".join(sql_select_parts)
 
-    if not select_sql_parts:
-        raise ValueError("No valid select expressions in plan")
+    # ---------------------------------------------------
+    # WHERE clause
+    # ---------------------------------------------------
+    where_clauses = []
+    params = []
 
-    select_clause = ", ".join(select_sql_parts)
-
-    # -------- WHERE --------
-    where_clauses: List[str] = []
     for f in filters:
-        if not isinstance(f, dict):
-            continue
         col = f.get("column")
-        op = (f.get("operator") or "=").upper()
+        op = f.get("operator", "=")
         val = f.get("value")
-        if not col:
-            continue
 
-        if op == "IN" and isinstance(val, (list, tuple)):
-            placeholders = ",".join("?" for _ in val)
+        if op.lower() == "in" and isinstance(val, list):
+            placeholders = ",".join(["?"] * len(val))
             where_clauses.append(f"[{col}] IN ({placeholders})")
-            params.extend(list(val))
-        elif op == "BETWEEN" and isinstance(val, (list, tuple)) and len(val) == 2:
-            where_clauses.append(f"[{col}] BETWEEN ? AND ?")
-            params.extend([val[0], val[1]])
+            params.extend(val)
         else:
             where_clauses.append(f"[{col}] {op} ?")
             params.append(val)
 
-    where_clause = " AND ".join(where_clauses) if where_clauses else "1=1"
+    where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
 
-    # -------- GROUP BY --------
+    # ---------------------------------------------------
+    # GROUP BY
+    # ---------------------------------------------------
     if group_by:
-        group_cols = [f"[{c}]" for c in group_by if c]
-        group_clause = " GROUP BY " + ", ".join(group_cols)
+        group_sql = " GROUP BY " + ", ".join([f"[{g}]" for g in group_by])
     else:
-        group_clause = ""
+        group_sql = ""
 
-    # -------- ORDER BY --------
+    # ---------------------------------------------------
+    # ORDER BY
+    # ---------------------------------------------------
     if order_by:
         ob_parts = []
         for ob in order_by:
-            if not isinstance(ob, dict):
-                continue
             col = ob.get("column")
-            if not col:
-                continue
-            direction = (ob.get("direction") or "DESC").upper()
-            if direction not in ("ASC", "DESC"):
-                direction = "DESC"
+            direction = ob.get("direction", "DESC").upper()
             ob_parts.append(f"[{col}] {direction}")
-        order_clause = " ORDER BY " + ", ".join(ob_parts) if ob_parts else ""
+        order_sql = " ORDER BY " + ", ".join(ob_parts)
     else:
-        order_clause = ""
+        order_sql = ""
 
-    # -------- LIMIT / TOP N --------
-    # For SQL Server we use OFFSET/FETCH (works in modern versions)
+    # ---------------------------------------------------
+    # LIMIT / TOP
+    # ---------------------------------------------------
+    top_sql = ""
     if isinstance(limit, int) and limit > 0:
-        limit_clause = f" OFFSET 0 ROWS FETCH NEXT {limit} ROWS ONLY"
-    else:
-        limit_clause = ""
+        top_sql = f"TOP {limit} "
 
-    sql = (
-        f"SELECT {select_clause} "
-        f"FROM {table} "
-        f"WHERE {where_clause}"
-        f"{group_clause}"
-        f"{order_clause}"
-        f"{limit_clause}"
-    )
+    # ---------------------------------------------------
+    # Final SQL
+    # ---------------------------------------------------
+    sql = f"""
+    SELECT {top_sql}{select_sql}
+    FROM {table_name}
+    WHERE {where_sql}
+    {group_sql}
+    {order_sql}
+    """.strip()
 
-    return sql, params, output_columns
+    return sql, params, columns_out
