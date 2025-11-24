@@ -1,114 +1,123 @@
 # sql_builder.py
-from typing import Dict, Any, List, Tuple
+from typing import Tuple, List, Dict, Any
 
-def _safe_col(col: str) -> str:
-    """Wrap column in SQL Server identifier brackets."""
-    return f"[{col}]"
-
-def build_sql_from_plan(plan: Dict[str, Any],
-                        table: str,
-                        schema: Dict[str, str]) -> Tuple[str, List[Any], List[str]]:
+def build_sql_from_plan(
+    plan: Dict[str, Any],
+    table: str,
+    schema: Dict[str, str]
+) -> Tuple[str, List[Any], List[str]]:
     """
-    Convert generic plan into SQL Server query + parameters + output columns.
+    Convert a generic plan from agent.extract_query into:
+      - SQL text with parameter placeholders
+      - list of parameter values
+      - list of output column aliases (for table rendering)
     """
-    if not isinstance(plan, dict):
-        raise ValueError("Plan must be a dict")
 
-    select_items = plan.get("select") or []
-    group_by_cols = plan.get("group_by") or []
+    selects = plan.get("select") or []
     filters = plan.get("filters") or []
+    group_by = plan.get("group_by") or []
     order_by = plan.get("order_by") or []
     limit = plan.get("limit")
 
-    # --- SELECT ---
-    output_columns: List[str] = []
+    if not selects:
+        raise ValueError("No valid select expressions in plan")
+
     select_sql_parts: List[str] = []
+    params: List[Any] = []
+    output_columns: List[str] = []
 
-    # 1) group_by columns first (dimension columns)
-    for col in group_by_cols:
-        if col in schema:
-            select_sql_parts.append(_safe_col(col))
-            output_columns.append(col)
-
-    # 2) measure columns (aggregations)
-    if not select_items:
-        raise ValueError("Plan has no select items")
-
-    for idx, sel in enumerate(select_items):
-        col = sel.get("column")
-        if col not in schema:
+    # -------- SELECT --------
+    for s in selects:
+        if not isinstance(s, dict):
             continue
-        agg = (sel.get("aggregation") or "").lower()
-        alias = sel.get("alias")
-        if not alias:
-            alias = f"{agg}_{col}" if agg else col
-        # If this is the only measure, prefer alias "value" for convenience
-        if len(select_items) == 1 and agg and alias not in output_columns:
-            alias = "value"
-        if agg:
-            select_sql_parts.append(f"{agg.upper()}({_safe_col(col)}) AS [{alias}]")
+        col = s.get("column")
+        expr = s.get("expression")
+        agg = (s.get("aggregation") or "sum").upper()
+        alias = s.get("alias") or (col or "value")
+
+        if expr:
+            inner = expr  # already proper SQL expression (e.g. [REVAmount] + [WIPAmount])
+        elif col:
+            inner = f"[{col}]"
         else:
-            select_sql_parts.append(f"{_safe_col(col)} AS [{alias}]")
+            continue
+
+        if agg in ("SUM", "AVG", "MAX", "MIN", "COUNT"):
+            select_piece = f"{agg}({inner}) AS [{alias}]"
+        else:
+            # no aggregation (rare)
+            select_piece = f"{inner} AS [{alias}]"
+
+        select_sql_parts.append(select_piece)
         output_columns.append(alias)
 
     if not select_sql_parts:
         raise ValueError("No valid select expressions in plan")
 
-    # TOP N
-    top_clause = ""
-    if isinstance(limit, int) and limit > 0:
-        top_clause = f"TOP {limit} "
+    select_clause = ", ".join(select_sql_parts)
 
-    sql = f"SELECT {top_clause}" + ", ".join(select_sql_parts) + f" FROM {table}"
-
-    # --- WHERE ---
+    # -------- WHERE --------
     where_clauses: List[str] = []
-    params: List[Any] = []
-
     for f in filters:
-        col = f.get("column")
-        if col not in schema:
+        if not isinstance(f, dict):
             continue
-        op = (f.get("operator") or "=").lower()
+        col = f.get("column")
+        op = (f.get("operator") or "=").upper()
         val = f.get("value")
+        if not col:
+            continue
 
-        if op == "in" and isinstance(val, (list, tuple, set)):
-            vals = list(val)
-            placeholders = ",".join("?" for _ in vals)
-            where_clauses.append(f"{_safe_col(col)} IN ({placeholders})")
-            params.extend(vals)
-        elif op == "between" and isinstance(val, (list, tuple)) and len(val) == 2:
-            where_clauses.append(f"{_safe_col(col)} BETWEEN ? AND ?")
+        if op == "IN" and isinstance(val, (list, tuple)):
+            placeholders = ",".join("?" for _ in val)
+            where_clauses.append(f"[{col}] IN ({placeholders})")
+            params.extend(list(val))
+        elif op == "BETWEEN" and isinstance(val, (list, tuple)) and len(val) == 2:
+            where_clauses.append(f"[{col}] BETWEEN ? AND ?")
             params.extend([val[0], val[1]])
         else:
-            if op not in ("=", "!=", "<>", ">", ">=", "<", "<=", "like"):
-                op = "="
-            where_clauses.append(f"{_safe_col(col)} {op.upper()} ?")
+            where_clauses.append(f"[{col}] {op} ?")
             params.append(val)
 
-    if where_clauses:
-        sql += " WHERE " + " AND ".join(where_clauses)
+    where_clause = " AND ".join(where_clauses) if where_clauses else "1=1"
 
-    # --- GROUP BY ---
-    if group_by_cols:
-        gb_cols = [_safe_col(c) for c in group_by_cols if c in schema]
-        if gb_cols:
-            sql += " GROUP BY " + ", ".join(gb_cols)
+    # -------- GROUP BY --------
+    if group_by:
+        group_cols = [f"[{c}]" for c in group_by if c]
+        group_clause = " GROUP BY " + ", ".join(group_cols)
+    else:
+        group_clause = ""
 
-    # --- ORDER BY ---
-    order_parts: List[str] = []
-    for ob in order_by:
-        col = ob.get("column")
-        direction = (ob.get("direction") or "desc").upper()
-        if direction not in ("ASC", "DESC"):
-            direction = "DESC"
-        # allow ordering by alias or group_by col
-        if col in output_columns:
-            order_parts.append(f"[{col}] {direction}")
-        elif col in group_by_cols:
-            order_parts.append(f"{_safe_col(col)} {direction}")
+    # -------- ORDER BY --------
+    if order_by:
+        ob_parts = []
+        for ob in order_by:
+            if not isinstance(ob, dict):
+                continue
+            col = ob.get("column")
+            if not col:
+                continue
+            direction = (ob.get("direction") or "DESC").upper()
+            if direction not in ("ASC", "DESC"):
+                direction = "DESC"
+            ob_parts.append(f"[{col}] {direction}")
+        order_clause = " ORDER BY " + ", ".join(ob_parts) if ob_parts else ""
+    else:
+        order_clause = ""
 
-    if order_parts:
-        sql += " ORDER BY " + ", ".join(order_parts)
+    # -------- LIMIT / TOP N --------
+    # For SQL Server we use OFFSET/FETCH (works in modern versions)
+    if isinstance(limit, int) and limit > 0:
+        limit_clause = f" OFFSET 0 ROWS FETCH NEXT {limit} ROWS ONLY"
+    else:
+        limit_clause = ""
+
+    sql = (
+        f"SELECT {select_clause} "
+        f"FROM {table} "
+        f"WHERE {where_clause}"
+        f"{group_clause}"
+        f"{order_clause}"
+        f"{limit_clause}"
+    )
 
     return sql, params, output_columns

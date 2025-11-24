@@ -53,8 +53,10 @@ def get_schema():
 
 def numeric_columns():
     schema = get_schema()
-    return [c for c, t in schema.items()
-            if t in ('decimal', 'numeric', 'money', 'float', 'int', 'bigint', 'smallint')]
+    return [
+        c for c, t in schema.items()
+        if t in ('decimal', 'numeric', 'money', 'float', 'int', 'bigint', 'smallint')
+    ]
 
 
 def categorical_columns():
@@ -69,54 +71,52 @@ def categorical_columns():
 
 
 # --------------------------------
-# Business metric rules (Option A)
+# Business metric rules
 # --------------------------------
-# We keep both:
-#  - a SQL expression (for future use in sql_builder)
-#  - a base column (so current sql_builder keeps working)
 BUSINESS_METRICS = {
     "revenue": {
-        "keywords": ["revenue", "total revenue", "sales", "turnover", "income"],
-        # Option A: sum over (REVAmount + WIPAmount)
+        "keywords": [
+            "revenue", "total revenue", "sales", "turnover", "income", "rev"
+        ],
+        # full SQL expression
         "expression": "[REVAmount] + [WIPAmount]",
         "base_column": "REVAmount",
         "default_agg": "sum",
-        "alias": "total_revenue"
+        "alias": "total_revenue",
     },
     "cost": {
-        "keywords": ["cost", "expense", "total cost"],
+        "keywords": [
+            "cost", "total cost", "expense", "expenses"
+        ],
         "expression": "[CSTAmount] + [ACRAmount]",
         "base_column": "CSTAmount",
         "default_agg": "sum",
-        "alias": "total_cost"
+        "alias": "total_cost",
     },
     "profit": {
-        "keywords": ["profit", "margin", "jobprofit"],
+        "keywords": [
+            "profit", "margin", "jobprofit", "total profit"
+        ],
         "expression": "[JobProfit]",
         "base_column": "JobProfit",
         "default_agg": "sum",
-        "alias": "total_profit"
+        "alias": "total_profit",
     },
-    # You can extend later: profit %, job count, volume, delay days, etc.
 }
 
-# Short descriptions + rules that we feed to the LLM
 BUSINESS_RULES_TEXT = """
 Key business metrics and rules:
 
 - Revenue = REVAmount + WIPAmount
   * REVAmount: revenue amount of the job.
   * WIPAmount: work-in-progress revenue adjustment.
+
 - Cost = CSTAmount + ACRAmount
   * CSTAmount: cost of service.
   * ACRAmount: additional cost recorded.
+
 - Profit = JobProfit
   * JobProfit: profit of the job.
-
-Time fields:
-- FinancialMonth: 1..12 (Apr..Mar in fiscal year)
-- FinancialQuarter: 1..4
-- FinancialYear: financial year.
 """
 
 COLUMN_DESCRIPTIONS_TEXT = """
@@ -126,10 +126,10 @@ Important columns:
 - FinancialMonth / FinancialQuarter / FinancialYear: fiscal calendar for the job.
 - CountryName / CountryGroup: customer's country & group.
 - CompanyCode, BranchCode, DeptCode: company, branch, department codes.
-- TransportMode: transport mode (SEA, AIR, ROA, COU, FSA, NOJ, NULL).
-- ContainerMode: container mode (BBK, FCL, LCL, LTL, etc.).
-- Direction: shipment direction like import, export, NOJ or others.
-- JobType: type of job (shipment / warehouse / brokerage).
+- TransportMode: SEA, AIR, ROA, COU, FSA, NOJ, NULL.
+- ContainerMode: container type (BBK, FCL, LCL, LTL, etc.).
+- Direction: import / export / NOJ / others.
+- JobType: shipment / warehouse / brokerage.
 - JobLevel1/2/3: freight / non-freight and detailed job type.
 - ProductLevel1/2/3: product category hierarchy (Air Export, Sea Import, etc.).
 - ActualVolume, UnitOfVolume: job volume and unit.
@@ -210,7 +210,7 @@ def parse_time_from_text(question: str):
 
 
 # --------------------------------
-# Simple helpers for fallback
+# Simple helpers
 # --------------------------------
 def detect_top_n(question: str):
     """Find 'top 5', 'top 10', 'first 3' etc."""
@@ -249,7 +249,7 @@ def detect_metric_column(question: str):
             return col
 
     # simple synonyms
-    if 'profit' in q and 'JobProfit' in schema:
+    if 'profit' in q and 'jobprofit' in schema:
         return 'JobProfit'
     if ('revenue' in q or 'sales' in q or 'turnover' in q) and 'REVAmount' in schema:
         return 'REVAmount'
@@ -260,7 +260,7 @@ def detect_metric_column(question: str):
 def detect_group_column(question: str):
     q = question.lower()
     cats = categorical_columns()
-    # words after "by ..."
+    # words after "by ... "
     m = re.search(r'\bby\s+([a-z0-9 _-]{2,40})', q)
     if m:
         candidate = m.group(1).strip()
@@ -297,18 +297,21 @@ def get_client():
 # --------------------------------
 def extract_query(question: str):
     """
-    Returns a *generic* query plan:
+    Returns a generic query plan:
 
     {
       "select": [
-        {"column": "JobProfit", "expression": null, "aggregation": "sum", "alias": "value"}
+        {
+          "column": "REVAmount",
+          "expression": "[REVAmount] + [WIPAmount]",
+          "aggregation": "sum",
+          "alias": "total_revenue",
+          "metric_key": "revenue"
+        }
       ],
-      "filters": [
-        {"column": "FinancialYear", "operator": "=", "value": 2024},
-        {"column": "TransportMode", "operator": "in", "value": ["SEA","AIR"]}
-      ],
-      "group_by": ["TransportMode"],
-      "order_by": [{"column": "value", "direction": "desc"}],
+      "filters": [...],
+      "group_by": [...],
+      "order_by": [...],
       "limit": 5
     }
     """
@@ -317,16 +320,13 @@ def extract_query(question: str):
     cats = categorical_columns()
     time_ctx = parse_time_from_text(question)
 
-    # --------------------
-    # 1. Build default / fallback plan
-    # --------------------
     q_lower = question.lower()
 
-    # detect business metric first
+    # --- 1. Choose metric (business first) ---
     bm_key = detect_business_metric_key(question)
     bm_meta = BUSINESS_METRICS.get(bm_key) if bm_key else None
 
-    # aggregation choice (can be overridden by business metric)
+    # aggregation default
     agg = "sum"
     if any(w in q_lower for w in ["average", "avg", "mean"]):
         agg = "avg"
@@ -340,22 +340,18 @@ def extract_query(question: str):
     select_entry = None
 
     if bm_meta:
-        # Business metric (e.g., revenue, cost, profit)
         base_col = bm_meta.get("base_column")
         if base_col and base_col not in nums:
-            base_col = None  # safety: don't treat non-numeric as column
+            base_col = None
 
         select_entry = {
-            # Keep real column so existing sql_builder still works
             "column": base_col,
-            # But also provide full Option-A expression for future use
             "expression": bm_meta.get("expression"),
             "aggregation": bm_meta.get("default_agg", agg),
-            "alias": bm_meta.get("alias") or bm_key,
-            "metric_key": bm_key
+            "alias": bm_meta.get("alias") or (bm_key or "value"),
+            "metric_key": bm_key,
         }
     else:
-        # Fallback to simple numeric column
         metric_col = detect_metric_column(question)
         if metric_col:
             select_entry = {
@@ -363,7 +359,7 @@ def extract_query(question: str):
                 "expression": None,
                 "aggregation": agg,
                 "alias": metric_col,
-                "metric_key": None
+                "metric_key": None,
             }
 
     group_col = detect_group_column(question)
@@ -374,29 +370,27 @@ def extract_query(question: str):
         "filters": [],
         "group_by": [group_col] if group_col else [],
         "order_by": [],
-        "limit": top_n
+        "limit": top_n,
     }
 
-    # --------------------
-    # 2. Try Groq to refine the plan
-    # --------------------
+    # --- 2. Ask Groq to improve plan (but do NOT let it break our business metrics) ---
     client = get_client()
     if client and base_plan["select"]:
         try:
             prompt = f"""
 You are a senior analytics engineer for a freight forwarding / logistics company.
 
-You must convert the user's natural-language question into a JSON description of a SQL query
+Convert the user's question into a JSON description of a SQL query
 over a single table called {TABLE_NAME}.
 
-Use ONLY these columns from the database:
+Use ONLY these columns:
 NUMERIC_COLUMNS = {nums}
 CATEGORICAL_COLUMNS = {cats}
 
 Column descriptions:
 {COLUMN_DESCRIPTIONS_TEXT}
 
-Business rules and metrics:
+Business rules:
 {BUSINESS_RULES_TEXT}
 
 JSON format (no extra text):
@@ -418,19 +412,16 @@ JSON format (no extra text):
 }}
 
 Guidelines:
-- ALWAYS use only columns from NUMERIC_COLUMNS and CATEGORICAL_COLUMNS.
+- Use only listed columns.
 - For revenue / total revenue / sales: use expression "REVAmount + WIPAmount".
 - For cost / total cost: use expression "CSTAmount + ACRAmount".
 - For profit / margin: use column "JobProfit".
-- If user says "top 5", "top 10", etc., set "limit" accordingly.
-- If user asks "by transport mode / by customer / by branch", add that column to group_by.
-- If user only wants a single total, leave group_by empty.
-- If unsure about filters, leave "filters" empty (they will be adjusted later).
-- You may use either "column" or "expression" in each select item. If you use "expression",
-  keep "column" null.
+- If user says "top N", set limit to that N.
+- If user asks "by X", add that column to group_by.
+- If unsure about filters, leave filters empty.
 
 User question:
-\"\"\"{question}\"\"\"
+\"\"\"{question}\"\"\" 
 
 Return ONLY valid JSON.
 """
@@ -438,14 +429,18 @@ Return ONLY valid JSON.
                 model="llama-3.1-8b-instant",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
-                max_tokens=256
+                max_tokens=256,
             )
             raw = resp.choices[0].message.content.strip()
             llm_plan = json.loads(raw)
 
-            # Merge LLM plan over fallback, but only if fields are non-empty
             if isinstance(llm_plan, dict):
-                for k, v in llm_plan.items():
+                # we NEVER let LLM override our select for business metrics
+                keys_to_merge = ["filters", "group_by", "order_by", "limit"]
+                if not bm_meta:
+                    keys_to_merge.append("select")
+                for k in keys_to_merge:
+                    v = llm_plan.get(k)
                     if v not in (None, "", []):
                         base_plan[k] = v
         except Exception as e:
@@ -453,11 +448,8 @@ Return ONLY valid JSON.
 
     plan = base_plan
 
-    # --------------------
-    # 3. Inject time filters (override any LLM guesses)
-    # --------------------
+    # --- 3. Inject time filters (override LLM) ---
     filters = plan.get("filters") or []
-    # Remove any time filters the LLM tried to guess (we own these)
     filters = [
         f for f in filters
         if f.get("column") not in ("FinancialYear", "FinancialQuarter", "FinancialMonth")
@@ -472,48 +464,47 @@ Return ONLY valid JSON.
 
     plan["filters"] = filters
 
-    # --------------------
-    # 4. Normalise / validate SELECT
-    # --------------------
+    # --- 4. Normalise SELECT and re-apply business rules ---
+    selects = plan.get("select") or []
+
     def is_valid_select(sel):
+        if not isinstance(sel, dict):
+            return False
         col = sel.get("column")
         expr = sel.get("expression")
-        if expr:  # expression is always allowed
+        if expr:
             return True
         if col and col in nums:
             return True
         return False
 
-    selects = plan.get("select") or []
-    valid_selects = [s for s in selects if isinstance(s, dict) and is_valid_select(s)]
+    valid_selects = [s for s in selects if is_valid_select(s)]
 
-    # If LLM destroyed our select, rebuild from fallback logic
     if not valid_selects:
-        # try business metric again
-        bm_key = detect_business_metric_key(question)
-        bm_meta = BUSINESS_METRICS.get(bm_key) if bm_key else None
-        q_lower = question.lower()
+        # rebuild with our logic
+        bm_key2 = detect_business_metric_key(question)
+        bm_meta2 = BUSINESS_METRICS.get(bm_key2) if bm_key2 else None
 
-        agg = "sum"
+        agg2 = "sum"
         if any(w in q_lower for w in ["average", "avg", "mean"]):
-            agg = "avg"
+            agg2 = "avg"
         if any(w in q_lower for w in ["count", "how many", "number of"]):
-            agg = "count"
+            agg2 = "count"
         if any(w in q_lower for w in ["max", "maximum", "highest", "largest"]):
-            agg = "max"
+            agg2 = "max"
         if any(w in q_lower for w in ["min", "minimum", "lowest", "smallest"]):
-            agg = "min"
+            agg2 = "min"
 
-        if bm_meta:
-            base_col = bm_meta.get("base_column")
+        if bm_meta2:
+            base_col = bm_meta2.get("base_column")
             if base_col and base_col not in nums:
                 base_col = None
             valid_selects = [{
                 "column": base_col,
-                "expression": bm_meta.get("expression"),
-                "aggregation": bm_meta.get("default_agg", agg),
-                "alias": bm_meta.get("alias") or (bm_key or "value"),
-                "metric_key": bm_key
+                "expression": bm_meta2.get("expression"),
+                "aggregation": bm_meta2.get("default_agg", agg2),
+                "alias": bm_meta2.get("alias") or (bm_key2 or "value"),
+                "metric_key": bm_key2,
             }]
         else:
             metric_col = detect_metric_column(question)
@@ -521,22 +512,21 @@ Return ONLY valid JSON.
                 valid_selects = [{
                     "column": metric_col,
                     "expression": None,
-                    "aggregation": agg,
+                    "aggregation": agg2,
                     "alias": metric_col,
-                    "metric_key": None
+                    "metric_key": None,
                 }]
 
-    # Final safety: if still empty, just pick first numeric column
     if not valid_selects and nums:
         valid_selects = [{
             "column": nums[0],
             "expression": None,
             "aggregation": "sum",
             "alias": nums[0],
-            "metric_key": None
+            "metric_key": None,
         }]
 
-    # Ensure every select has alias
+    # final alias fix
     for s in valid_selects:
         if not s.get("alias"):
             if s.get("metric_key"):
@@ -548,9 +538,7 @@ Return ONLY valid JSON.
 
     plan["select"] = valid_selects
 
-    # --------------------
-    # 5. Clean up ORDER BY / LIMIT types
-    # --------------------
+    # --- 5. Clean ORDER BY and LIMIT ---
     order_by = plan.get("order_by") or []
     cleaned_ob = []
     for ob in order_by:
@@ -565,7 +553,6 @@ Return ONLY valid JSON.
         cleaned_ob.append({"column": col, "direction": direction})
     plan["order_by"] = cleaned_ob
 
-    # Normalise limit
     limit = plan.get("limit")
     if isinstance(limit, str) and limit.isdigit():
         limit = int(limit)
