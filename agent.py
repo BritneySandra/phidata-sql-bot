@@ -11,11 +11,11 @@ load_dotenv()
 
 TABLE_NAME = "WBI_BI_Data_V2"
 
-# ================================================================
-# 1. SCHEMA LOADING
-# ================================================================
+# --------------------------------
+# Load schema from SQL Server
+# --------------------------------
 def load_sql_schema():
-    """Read INFORMATION_SCHEMA for the target table and return {column: data_type}."""
+    """Read INFORMATION_SCHEMA for the target table."""
     try:
         conn = pyodbc.connect(
             f"DRIVER={{ODBC Driver 18 for SQL Server}};"
@@ -50,185 +50,106 @@ def get_schema():
         _SCHEMA = load_sql_schema()
     return _SCHEMA
 
+
 def numeric_columns():
     schema = get_schema()
-    return [
-        c for c, t in schema.items()
-        if t in ('decimal', 'numeric', 'money', 'float', 'int', 'bigint', 'smallint')
-    ]
+    return [c for c, t in schema.items()
+            if t in ('decimal', 'numeric', 'money', 'float', 'int', 'bigint', 'smallint')]
+
 
 def categorical_columns():
-    """
-    Treat everything that is not numeric/date as a dimension (category).
-    """
+    """Treat everything that is not numeric/date as a dimension."""
     schema = get_schema()
     nums = set(numeric_columns())
     cats = [
         c for c, t in schema.items()
-        if c not in nums and t not in ('date', 'datetime', 'smalldatetime', 'datetime2', 'datetimeoffset')
+        if c not in nums and t not in ('date', 'datetime', 'smalldatetime', 'datetime2')
     ]
     return cats
 
 
-# ================================================================
-# 2. COLUMN DESCRIPTIONS (for LLM understanding only)
-# ================================================================
-COLUMN_DESCRIPTIONS = {
-    "JobPK": "Unique identifier for each job (primary key).",
-    "JobNumber": "Identifier for brokerage, shipment and warehouse jobs.",
-    "TransactionMonth": "Month when the customer transaction happened (1-12).",
-    "TransactionYear": "Year when the customer transaction happened.",
-    "FinancialMonth": "Financial month (1=Apr, 2=May, ..., 12=Mar).",
-    "FinancialQuarter": "Financial quarter number.",
-    "FinancialYear": "Financial year.",
-    "FYMonth": "Combined FY year and month, e.g. FY-18-Dec.",
-    "FYQuarter": "Combined FY year and quarter, e.g. FY-18-Q4.",
-    "FYYear": "Financial year label, e.g. FY-25.",
-    "CountryPK": "Unique identifier for country (primary key).",
-    "CountryName": "Customer's country.",
-    "CountryGroup": "Customer country group.",
-    "CompanyPK": "Unique identifier for company (primary key).",
-    "CompanyCode": "Customer's company code.",
-    "BranchPK": "Unique identifier for branch (primary key).",
-    "BranchCode": "Customer's branch code.",
-    "DeptPK": "Unique identifier for department (primary key).",
-    "DeptCode": "Customer's department code.",
-    "JobStatus": "Status of the shipment/job.",
-    "JobRevenueStatus": "Revenue/payment status of shipment/job.",
-    "TransportMode": "Transport mode of the shipment/job (NULL, AIR, COU, FSA, NOJ, ROA, SEA).",
-    "ContainerMode": "Container mode (BBK, BCN, CNT, CON, FCL, FTL, JHB, LCL, LSE, LTL, OBC, ROR, SCN, UNA, NOJ, NULL).",
-    "Direction": "Shipment direction: import/export/NOJ/other.",
-    "JobType": "Type of job: shipment/warehouse/brokerage.",
-    "JobLevel1": "Freight vs non-freight classification.",
-    "JobLevel2": "Job level 2 (CrossTrade, Destination, Freight, Origin, Others, PassThrough, Transportation, Warehouse).",
-    "JobLevel3": "Job level 3 (CrossTrade, Customs-Export, Customs-Import, Destination Job, Freight-P2P, Origin Job, Others, PassThrough, Transportation, Transportation-Export, Transportation-Import, Warehouse).",
-    "ProductLevel1": "High-level product category (Air Export, Air Import, Cartage-Delivery, Cartage-FCL, Cartage-Others, Cartage-Pickup, Cartage-SeaExport, Cartage-SeaImport, Customs, Others, Sea Export, Sea Import).",
-    "ProductLevel2": "Second level product category (Cartage-Delivery, Cartage-FCL, Cartage-Others, Cartage-Pickup, Cartage-SeaExport, Cartage-SeaImport, FCL, LCL, LSE).",
-    "ProductLevel3": "Third level product category (BBK, BCN, CNT, CON, FCL, FTL, JHB, LCL, LSE, LTL, OBC, ROR, SCN, UNA, NULL).",
-    "OriginETD": "Estimated time of departure from origin country.",
-    "DestinationETA": "Estimated time of arrival to destination country.",
-    "ActualVolume": "Total shipment/job volume.",
-    "UnitOfVolume": "Unit of volume (tons, kg, m3, etc.).",
-    "ActualChargeable": "Actual chargeable amount of job.",
-    "ChargeableUnit": "Unit for chargeable quantity (KG, M3, etc.).",
-    "TEU": "TEU volume for the job.",
-    "AirVolumeInTons": "Volume in tons for transport mode AIR.",
-    "AirVolumeInCBM": "Volume in CBM for AIR.",
-    "SeaVolumeLCL": "Volume in LCL for SEA.",
-    "SeaVolumeFCL": "Volume in FCL for SEA.",
-    "SeaVolumeFCLTEU": "FCL volume in TEU for SEA.",
-    "FinalVolumeinCBM": "Final volume of job in cubic meters.",
-    "CustomerCode": "Customer code.",
-    "CustomerName": "Customer name.",
-    "CustomerGroup": "Customer group code.",
-    "CustomerGroupName": "Customer group name.",
-    "CustomerLeadGroup": "Customer lead group code.",
-    "CustomerLeadGroupName": "Customer lead group name.",
-    "ConsolNo": "Consolidated job number.",
-    "ConsolATA": "Actual time of arrival for consolidated shipment.",
-    "ConsolATD": "Actual time of departure for consolidated shipment.",
-    "OriginCountry": "Origin country of the shipment.",
-    "DestinationCountry": "Destination country of the shipment.",
-    "Incoterm": "International commercial terms (trade agreement between buyer and seller).",
-    "OriginContinent": "Origin continent.",
-    "DestinationContinent": "Destination continent.",
-    "ACRAmount": "Accrual amount (additional cost recorded).",
-    "CSTAmount": "Cost amount (cost of service).",
-    "WIPAmount": "Work-in-progress revenue adjustment.",
-    "REVAmount": "Base revenue amount for the job.",
-    "JobProfit": "Profit for the job (revenue - cost)."
-}
-
-# ================================================================
-# 3. BUSINESS METRICS (virtual measures)
-# ================================================================
-# These are NOT physical columns; they are SQL expressions or aggregate formulas.
+# --------------------------------
+# Business metric rules (Option A)
+# --------------------------------
+# We keep both:
+#  - a SQL expression (for future use in sql_builder)
+#  - a base column (so current sql_builder keeps working)
 BUSINESS_METRICS = {
-    "Revenue": {
-        "type": "expression",   # row-level expression wrapped in aggregation
-        "sql": "(REVAmount + WIPAmount)",
-        "description": "Revenue = REVAmount + WIPAmount (base revenue plus WIP adjustment).",
+    "revenue": {
+        "keywords": ["revenue", "total revenue", "sales", "turnover", "income"],
+        # Option A: sum over (REVAmount + WIPAmount)
+        "expression": "[REVAmount] + [WIPAmount]",
+        "base_column": "REVAmount",
         "default_agg": "sum",
-        "synonyms": ["revenue", "total revenue", "sales", "turnover", "income"]
+        "alias": "total_revenue"
     },
-    "Cost": {
-        "type": "expression",
-        "sql": "(CSTAmount + ACRAmount)",
-        "description": "Cost = CSTAmount + ACRAmount (service cost plus accruals).",
+    "cost": {
+        "keywords": ["cost", "expense", "total cost"],
+        "expression": "[CSTAmount] + [ACRAmount]",
+        "base_column": "CSTAmount",
         "default_agg": "sum",
-        "synonyms": ["cost", "total cost", "expenses", "service cost"]
+        "alias": "total_cost"
     },
-    "Profit": {
-        "type": "column",
-        "sql": "JobProfit",
-        "description": "Profit = JobProfit.",
+    "profit": {
+        "keywords": ["profit", "margin", "jobprofit"],
+        "expression": "[JobProfit]",
+        "base_column": "JobProfit",
         "default_agg": "sum",
-        "synonyms": ["profit", "job profit", "margin", "earnings"]
+        "alias": "total_profit"
     },
-    "ProfitPercent": {
-        "type": "aggregate_expression",
-        "sql": "SUM(JobProfit) / NULLIF(SUM(CSTAmount + ACRAmount), 0)",
-        "description": "Profit % = Total Profit / Total Cost.",
-        "default_agg": None,
-        "synonyms": ["profit %", "margin %", "profit percentage", "margin percentage", "profit ratio"]
-    },
-    "TotalJobCount": {
-        "type": "aggregate_expression",
-        "sql": "COUNT(DISTINCT JobNumber)",
-        "description": "Total Job Count = distinct count of JobNumber.",
-        "default_agg": None,
-        "synonyms": ["total job count", "job count", "number of jobs", "jobs"]
-    },
-    "TotalVolume": {
-        "type": "aggregate_expression",
-        # Approximation of your DAX SUMX(VALUES(JobNumber), AVERAGE(ActualVolume)):
-        "sql": "SUM(ActualVolume)",
-        "description": "Total Volume = sum of ActualVolume (approximation of per-job average volume).",
-        "default_agg": None,
-        "synonyms": ["total volume", "volume", "shipment volume"]
-    },
-    "TradeLaneContinent": {
-        "type": "expression",
-        "sql": "(OriginContinent + '-' + DestinationContinent)",
-        "description": "Trade Lane Continent = OriginContinent + '-' + DestinationContinent.",
-        "default_agg": None,
-        "synonyms": ["trade lane continent", "continent lane"]
-    },
-    "TradeLaneCountry": {
-        "type": "expression",
-        "sql": "(OriginCountry + '-' + DestinationCountry)",
-        "description": "Trade Lane Country = OriginCountry + '-' + DestinationCountry.",
-        "default_agg": None,
-        "synonyms": ["trade lane", "trade lane country", "country lane", "origin-destination"]
-    },
-    "Arrival_Delay_Days": {
-        "type": "expression",
-        "sql": "DATEDIFF(day, DestinationETA, ConsolATA)",
-        "description": "Arrival_Delay_Days = DATEDIFF(day, DestinationETA, ConsolATA).",
-        "default_agg": "avg",
-        "synonyms": ["arrival delay", "arrival delay days", "eta delay"]
-    },
-    "Departure_Delay_Days": {
-        "type": "expression",
-        "sql": "DATEDIFF(day, OriginETD, ConsolATD)",
-        "description": "Departure_Delay_Days = DATEDIFF(day, OriginETD, ConsolATD).",
-        "default_agg": "avg",
-        "synonyms": ["departure delay", "departure delay days", "etd delay"]
-    }
+    # You can extend later: profit %, job count, volume, delay days, etc.
 }
 
-def get_business_metrics():
-    """Expose definitions so sql_builder.py can import and use them."""
-    return BUSINESS_METRICS
+# Short descriptions + rules that we feed to the LLM
+BUSINESS_RULES_TEXT = """
+Key business metrics and rules:
+
+- Revenue = REVAmount + WIPAmount
+  * REVAmount: revenue amount of the job.
+  * WIPAmount: work-in-progress revenue adjustment.
+- Cost = CSTAmount + ACRAmount
+  * CSTAmount: cost of service.
+  * ACRAmount: additional cost recorded.
+- Profit = JobProfit
+  * JobProfit: profit of the job.
+
+Time fields:
+- FinancialMonth: 1..12 (Apr..Mar in fiscal year)
+- FinancialQuarter: 1..4
+- FinancialYear: financial year.
+"""
+
+COLUMN_DESCRIPTIONS_TEXT = """
+Important columns:
+- JobNumber: identifies shipment / brokerage / warehouse job.
+- TransactionMonth / TransactionYear: when the customer transaction happened.
+- FinancialMonth / FinancialQuarter / FinancialYear: fiscal calendar for the job.
+- CountryName / CountryGroup: customer's country & group.
+- CompanyCode, BranchCode, DeptCode: company, branch, department codes.
+- TransportMode: transport mode (SEA, AIR, ROA, COU, FSA, NOJ, NULL).
+- ContainerMode: container mode (BBK, FCL, LCL, LTL, etc.).
+- Direction: shipment direction like import, export, NOJ or others.
+- JobType: type of job (shipment / warehouse / brokerage).
+- JobLevel1/2/3: freight / non-freight and detailed job type.
+- ProductLevel1/2/3: product category hierarchy (Air Export, Sea Import, etc.).
+- ActualVolume, UnitOfVolume: job volume and unit.
+- ActualChargeable, ChargeableUnit: chargeable amount and unit.
+- OriginCountry / DestinationCountry / Incoterm / OriginContinent / DestinationContinent.
+- ACRAmount: accrual amount.
+- CSTAmount: cost of the shipment.
+- WIPAmount: work-in-progress revenue.
+- REVAmount: revenue amount of job.
+- JobProfit: profit of job.
+"""
 
 
-# ================================================================
-# 4. TIME PARSING
-# ================================================================
+# --------------------------------
+# Time parsing helper
+# --------------------------------
 def parse_time_from_text(question: str):
     """
     Returns: {"year": int|None, "quarter": int|None, "month": int|None, "timeframe": str|None}
-    Handles 'last year', 'last quarter', month names etc.
+    Resolves 'last year', 'last quarter', month names, etc. to explicit numbers.
     """
     q = question.lower()
     now = datetime.utcnow()
@@ -288,11 +209,11 @@ def parse_time_from_text(question: str):
     return res
 
 
-# ================================================================
-# 5. SIMPLE FALLBACK HELPERS
-# ================================================================
+# --------------------------------
+# Simple helpers for fallback
+# --------------------------------
 def detect_top_n(question: str):
-    """Find 'top 5', 'top 10', 'first 3', '10 customers', etc."""
+    """Find 'top 5', 'top 10', 'first 3' etc."""
     q = question.lower()
     m = re.search(r'top\s+(\d+)', q)
     if m:
@@ -300,61 +221,54 @@ def detect_top_n(question: str):
     m = re.search(r'first\s+(\d+)', q)
     if m:
         return int(m.group(1))
-    m = re.search(r'(\d+)\s+(?:customers|clients|branches|rows|records|jobs|lanes)', q)
+    m = re.search(r'(\d+)\s+(?:customers|clients|branches|rows|records|jobs)', q)
     if m:
         return int(m.group(1))
     return None
 
 
-def detect_metric(question: str):
-    """
-    Decide which metric the user is asking for.
-    We first check business metrics, then physical numeric columns.
-    """
+def detect_business_metric_key(question: str):
+    """Return 'revenue', 'cost', 'profit', ... if question matches."""
+    q = question.lower()
+    for key, meta in BUSINESS_METRICS.items():
+        for kw in meta.get("keywords", []):
+            if kw in q:
+                return key
+    return None
+
+
+def detect_metric_column(question: str):
+    """Fallback numeric column if no business metric is matched."""
     q = question.lower()
     schema = get_schema()
     nums = numeric_columns()
 
-    # 1) Business metric synonyms (Revenue, Cost, Profit%, etc.)
-    for name, meta in BUSINESS_METRICS.items():
-        for syn in meta.get("synonyms", []):
-            if syn in q:
-                return name   # return virtual metric name
-
-    # 2) explicit physical numeric column
+    # direct mention
     for col in nums:
         if col.lower() in q:
             return col
 
-    # 3) generic words for revenue/profit if not caught above
+    # simple synonyms
     if 'profit' in q and 'JobProfit' in schema:
-        return 'Profit'
+        return 'JobProfit'
     if ('revenue' in q or 'sales' in q or 'turnover' in q) and 'REVAmount' in schema:
-        return 'Revenue'
+        return 'REVAmount'
 
-    # 4) fallback: first numeric column
     return nums[0] if nums else None
 
 
 def detect_group_column(question: str):
-    """
-    Try to detect grouping column from words like:
-    'by transport mode', 'by customer', 'by branch', etc.
-    """
     q = question.lower()
     cats = categorical_columns()
-
     # words after "by ..."
     m = re.search(r'\bby\s+([a-z0-9 _-]{2,40})', q)
-    candidate = None
     if m:
         candidate = m.group(1).strip()
         candidate_nospace = candidate.replace(" ", "").lower()
         for col in cats:
             if candidate_nospace in col.lower():
                 return col
-
-    # simple keyword-based mapping
+    # simple keywords
     if 'transport' in q and 'TransportMode' in cats:
         return 'TransportMode'
     if 'product' in q and 'ProductLevel1' in cats:
@@ -363,17 +277,14 @@ def detect_group_column(question: str):
         return 'BranchCode'
     if 'customer' in q and 'CustomerName' in cats:
         return 'CustomerName'
-    if 'company' in q and 'CompanyCode' in cats:
-        return 'CompanyCode'
     if 'country' in q and 'CountryName' in cats:
         return 'CountryName'
-
     return None
 
 
-# ================================================================
-# 6. Groq client
-# ================================================================
+# --------------------------------
+# Groq client
+# --------------------------------
 def get_client():
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
@@ -381,16 +292,16 @@ def get_client():
     return Groq(api_key=api_key)
 
 
-# ================================================================
-# 7. Main: question -> generic JSON query plan
-# ================================================================
+# --------------------------------
+# Main: question -> generic JSON plan
+# --------------------------------
 def extract_query(question: str):
     """
     Returns a *generic* query plan:
 
     {
       "select": [
-        {"column": "Revenue", "aggregation": "sum", "alias": "value"}
+        {"column": "JobProfit", "expression": null, "aggregation": "sum", "alias": "value"}
       ],
       "filters": [
         {"column": "FinancialYear", "operator": "=", "value": 2024},
@@ -400,11 +311,6 @@ def extract_query(question: str):
       "order_by": [{"column": "value", "direction": "desc"}],
       "limit": 5
     }
-
-    NOTE: "column" can be:
-      - a physical column (e.g. 'REVAmount')
-      - a business metric name (e.g. 'Revenue', 'ProfitPercent')
-    The actual SQL expansion happens in sql_builder.py using BUSINESS_METRICS.
     """
     schema = get_schema()
     nums = numeric_columns()
@@ -412,38 +318,59 @@ def extract_query(question: str):
     time_ctx = parse_time_from_text(question)
 
     # --------------------
-    # 1. Default / fallback plan
+    # 1. Build default / fallback plan
     # --------------------
-    metric = detect_metric(question)
-    if not metric:
-        metric = nums[0] if nums else None
-
-    # aggregation
-    agg = "sum"
     q_lower = question.lower()
+
+    # detect business metric first
+    bm_key = detect_business_metric_key(question)
+    bm_meta = BUSINESS_METRICS.get(bm_key) if bm_key else None
+
+    # aggregation choice (can be overridden by business metric)
+    agg = "sum"
     if any(w in q_lower for w in ["average", "avg", "mean"]):
         agg = "avg"
     if any(w in q_lower for w in ["count", "how many", "number of"]):
         agg = "count"
-    if any(w in q_lower for w in ["max", "maximum", "highest", "largest", "top"]):
+    if any(w in q_lower for w in ["max", "maximum", "highest", "largest"]):
         agg = "max"
     if any(w in q_lower for w in ["min", "minimum", "lowest", "smallest"]):
         agg = "min"
 
-    # if metric is a business metric with a recommended default aggregation, use it
-    if metric in BUSINESS_METRICS:
-        default_agg = BUSINESS_METRICS[metric].get("default_agg")
-        if default_agg:
-            agg = default_agg
+    select_entry = None
+
+    if bm_meta:
+        # Business metric (e.g., revenue, cost, profit)
+        base_col = bm_meta.get("base_column")
+        if base_col and base_col not in nums:
+            base_col = None  # safety: don't treat non-numeric as column
+
+        select_entry = {
+            # Keep real column so existing sql_builder still works
+            "column": base_col,
+            # But also provide full Option-A expression for future use
+            "expression": bm_meta.get("expression"),
+            "aggregation": bm_meta.get("default_agg", agg),
+            "alias": bm_meta.get("alias") or bm_key,
+            "metric_key": bm_key
+        }
+    else:
+        # Fallback to simple numeric column
+        metric_col = detect_metric_column(question)
+        if metric_col:
+            select_entry = {
+                "column": metric_col,
+                "expression": None,
+                "aggregation": agg,
+                "alias": metric_col,
+                "metric_key": None
+            }
 
     group_col = detect_group_column(question)
     top_n = detect_top_n(question)
 
     base_plan = {
-        "select": (
-            [{"column": metric, "aggregation": agg, "alias": "value"}]
-            if metric else []
-        ),
+        "select": [select_entry] if select_entry else [],
         "filters": [],
         "group_by": [group_col] if group_col else [],
         "order_by": [],
@@ -454,45 +381,33 @@ def extract_query(question: str):
     # 2. Try Groq to refine the plan
     # --------------------
     client = get_client()
-    if client and metric:
+    if client and base_plan["select"]:
         try:
-            # Build a compact description of business metrics for the prompt
-            bm_for_prompt = {
-                name: {
-                    "sql": meta["sql"],
-                    "description": meta["description"]
-                }
-                for name, meta in BUSINESS_METRICS.items()
-            }
-
             prompt = f"""
-You are a senior analytics engineer.
+You are a senior analytics engineer for a freight forwarding / logistics company.
 
-You have:
-- A physical SQL table: {TABLE_NAME}
-- Physical numeric columns: {nums}
-- Physical categorical columns: {cats}
-- Business metrics (virtual expressions):
-{json.dumps(bm_for_prompt, indent=2)}
+You must convert the user's natural-language question into a JSON description of a SQL query
+over a single table called {TABLE_NAME}.
 
-Column descriptions (partial):
-{json.dumps(COLUMN_DESCRIPTIONS, indent=2)}
+Use ONLY these columns from the database:
+NUMERIC_COLUMNS = {nums}
+CATEGORICAL_COLUMNS = {cats}
 
-TASK:
-Convert the user's QUESTION into a JSON description of a SQL query.
+Column descriptions:
+{COLUMN_DESCRIPTIONS_TEXT}
 
-IMPORTANT:
-- When the user says "revenue", "cost", "profit %", "total job count", "total volume", etc.,
-  use the BUSINESS METRIC NAME (e.g. "Revenue", "Cost", "ProfitPercent", "TotalJobCount")
-  as the "column" in the select, not the raw column names.
-- Use ONLY numeric columns or business metrics in "select".
-- Use ONLY the listed columns in "filters" and "group_by".
+Business rules and metrics:
+{BUSINESS_RULES_TEXT}
 
-JSON FORMAT (no extra text):
-
+JSON format (no extra text):
 {{
   "select": [
-    {{"column": "<numeric column OR business metric name>", "aggregation": "sum|avg|max|min|count", "alias": "value"}}
+    {{
+      "column": "<numeric column or null>",
+      "expression": "<SQL expression or null>",
+      "aggregation": "sum|avg|max|min|count",
+      "alias": "<short_name>"
+    }}
   ],
   "filters": [
     {{"column": "<column>", "operator": "=|!=|>|<|>=|<=|in|between|like", "value": "<scalar or list>"}}
@@ -503,17 +418,19 @@ JSON FORMAT (no extra text):
 }}
 
 Guidelines:
-- If the user says "top 5", "top 10", etc., set "limit" to that integer.
-- If the user asks "by transport mode / by customer / by branch / by country / by product level",
-  add those columns to "group_by".
-- For a single overall total, leave "group_by" empty.
-- If unsure about filters, leave "filters" empty.
-- Do NOT invent columns that are not in the lists.
-- "column" may be a business metric name (e.g. "Revenue") or a physical numeric column.
+- ALWAYS use only columns from NUMERIC_COLUMNS and CATEGORICAL_COLUMNS.
+- For revenue / total revenue / sales: use expression "REVAmount + WIPAmount".
+- For cost / total cost: use expression "CSTAmount + ACRAmount".
+- For profit / margin: use column "JobProfit".
+- If user says "top 5", "top 10", etc., set "limit" accordingly.
+- If user asks "by transport mode / by customer / by branch", add that column to group_by.
+- If user only wants a single total, leave group_by empty.
+- If unsure about filters, leave "filters" empty (they will be adjusted later).
+- You may use either "column" or "expression" in each select item. If you use "expression",
+  keep "column" null.
 
-USER QUESTION:
+User question:
 \"\"\"{question}\"\"\"
-
 
 Return ONLY valid JSON.
 """
@@ -521,12 +438,12 @@ Return ONLY valid JSON.
                 model="llama-3.1-8b-instant",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
-                max_tokens=512
+                max_tokens=256
             )
             raw = resp.choices[0].message.content.strip()
             llm_plan = json.loads(raw)
 
-            # Merge LLM plan over fallback
+            # Merge LLM plan over fallback, but only if fields are non-empty
             if isinstance(llm_plan, dict):
                 for k, v in llm_plan.items():
                     if v not in (None, "", []):
@@ -537,46 +454,123 @@ Return ONLY valid JSON.
     plan = base_plan
 
     # --------------------
-    # 3. Inject time filters (override any LLM time guesses)
+    # 3. Inject time filters (override any LLM guesses)
     # --------------------
     filters = plan.get("filters") or []
-    # Drop any FinancialYear/Quarter/Month filters the LLM may have added
+    # Remove any time filters the LLM tried to guess (we own these)
     filters = [
         f for f in filters
-        if str(f.get("column")) not in ("FinancialYear", "FinancialQuarter", "FinancialMonth")
+        if f.get("column") not in ("FinancialYear", "FinancialQuarter", "FinancialMonth")
     ]
 
     if time_ctx.get("year"):
-        filters.append({
-            "column": "FinancialYear",
-            "operator": "=",
-            "value": time_ctx["year"]
-        })
+        filters.append({"column": "FinancialYear", "operator": "=", "value": time_ctx["year"]})
     if time_ctx.get("quarter"):
-        filters.append({
-            "column": "FinancialQuarter",
-            "operator": "=",
-            "value": time_ctx["quarter"]
-        })
+        filters.append({"column": "FinancialQuarter", "operator": "=", "value": time_ctx["quarter"]})
     if time_ctx.get("month"):
-        filters.append({
-            "column": "FinancialMonth",
-            "operator": "=",
-            "value": time_ctx["month"]
-        })
+        filters.append({"column": "FinancialMonth", "operator": "=", "value": time_ctx["month"]})
 
     plan["filters"] = filters
 
-    # Ensure select exists
-    if not plan.get("select"):
-        if metric:
-            plan["select"] = [{"column": metric, "aggregation": agg, "alias": "value"}]
+    # --------------------
+    # 4. Normalise / validate SELECT
+    # --------------------
+    def is_valid_select(sel):
+        col = sel.get("column")
+        expr = sel.get("expression")
+        if expr:  # expression is always allowed
+            return True
+        if col and col in nums:
+            return True
+        return False
 
-    # Ensure limit is int or None
+    selects = plan.get("select") or []
+    valid_selects = [s for s in selects if isinstance(s, dict) and is_valid_select(s)]
+
+    # If LLM destroyed our select, rebuild from fallback logic
+    if not valid_selects:
+        # try business metric again
+        bm_key = detect_business_metric_key(question)
+        bm_meta = BUSINESS_METRICS.get(bm_key) if bm_key else None
+        q_lower = question.lower()
+
+        agg = "sum"
+        if any(w in q_lower for w in ["average", "avg", "mean"]):
+            agg = "avg"
+        if any(w in q_lower for w in ["count", "how many", "number of"]):
+            agg = "count"
+        if any(w in q_lower for w in ["max", "maximum", "highest", "largest"]):
+            agg = "max"
+        if any(w in q_lower for w in ["min", "minimum", "lowest", "smallest"]):
+            agg = "min"
+
+        if bm_meta:
+            base_col = bm_meta.get("base_column")
+            if base_col and base_col not in nums:
+                base_col = None
+            valid_selects = [{
+                "column": base_col,
+                "expression": bm_meta.get("expression"),
+                "aggregation": bm_meta.get("default_agg", agg),
+                "alias": bm_meta.get("alias") or (bm_key or "value"),
+                "metric_key": bm_key
+            }]
+        else:
+            metric_col = detect_metric_column(question)
+            if metric_col:
+                valid_selects = [{
+                    "column": metric_col,
+                    "expression": None,
+                    "aggregation": agg,
+                    "alias": metric_col,
+                    "metric_key": None
+                }]
+
+    # Final safety: if still empty, just pick first numeric column
+    if not valid_selects and nums:
+        valid_selects = [{
+            "column": nums[0],
+            "expression": None,
+            "aggregation": "sum",
+            "alias": nums[0],
+            "metric_key": None
+        }]
+
+    # Ensure every select has alias
+    for s in valid_selects:
+        if not s.get("alias"):
+            if s.get("metric_key"):
+                s["alias"] = s["metric_key"]
+            elif s.get("column"):
+                s["alias"] = s["column"]
+            else:
+                s["alias"] = "value"
+
+    plan["select"] = valid_selects
+
+    # --------------------
+    # 5. Clean up ORDER BY / LIMIT types
+    # --------------------
+    order_by = plan.get("order_by") or []
+    cleaned_ob = []
+    for ob in order_by:
+        if not isinstance(ob, dict):
+            continue
+        col = ob.get("column")
+        if not col:
+            continue
+        direction = ob.get("direction", "desc").lower()
+        if direction not in ("asc", "desc"):
+            direction = "desc"
+        cleaned_ob.append({"column": col, "direction": direction})
+    plan["order_by"] = cleaned_ob
+
+    # Normalise limit
     limit = plan.get("limit")
     if isinstance(limit, str) and limit.isdigit():
-        plan["limit"] = int(limit)
-    if not isinstance(plan.get("limit"), int):
-        plan["limit"] = None
+        limit = int(limit)
+    if not isinstance(limit, int):
+        limit = detect_top_n(question)
+    plan["limit"] = limit
 
     return plan
