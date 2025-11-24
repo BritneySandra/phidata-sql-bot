@@ -205,7 +205,14 @@ def detect_group_column(question: str):
         "product": "ProductLevel1",
         "product level 1": "ProductLevel1",
         "product level 2": "ProductLevel2",
-        "product level 3": "ProductLevel3"
+        "product level 3": "ProductLevel3",
+        "origin country": "OriginCountry",
+        "destination country": "DestinationCountry",
+        "origin continent": "OriginContinent",
+        "destination continent": "DestinationContinent",
+        "job type": "JobType",
+        "job status": "JobStatus",
+        "ContainerMode":"Container mode"
     }
 
     for key, col in DIRECT_MAP.items():
