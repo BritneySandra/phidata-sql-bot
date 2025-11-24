@@ -1,4 +1,3 @@
-# agent.py
 from groq import Groq
 import os
 import json
@@ -162,7 +161,7 @@ def detect_top_n(question: str):
 
 
 # ------------------------------------------------------
-# Detect Sorting Intent (highest/lowest/least/biggest)
+# Detect Sorting Intent (highest/lowest/least)
 # ------------------------------------------------------
 def detect_sort_intent(question: str):
     q = question.lower()
@@ -174,7 +173,7 @@ def detect_sort_intent(question: str):
 
     ASC_WORDS = [
         "lowest", "least", "minimum", "min", "smallest",
-        "bottom", "weaker", "less", "smaller"
+        "bottom", "weaker", "less", "smaller", "lower", "lesser"
     ]
 
     for w in DESC_WORDS:
@@ -356,12 +355,26 @@ def extract_query(question: str):
     if dim_filters:
         plan["filters"].extend(dim_filters)
 
-    # SORTING INTENT (highest/lowest)
-    sort_dir = detect_sort_intent(question)
-    if sort_dir:
-        plan["order_by"] = [{
-            "column": select_entry["alias"],
-            "direction": sort_dir
-        }]
+    # --------------------------------
+    # ORDER BY detection (ASC / DESC)
+    # --------------------------------
+    direction = None
+    q = question.lower()
+
+    # HIGH → DESC
+    if any(word in q for word in ["highest", "top", "most", "max", "maximum",
+                                  "larger", "greater", "biggest", "strongest"]):
+        direction = "DESC"
+
+    # LOW → ASC
+    elif any(word in q for word in ["least", "lowest", "lower", "lesser",
+                                    "min", "minimum", "smallest", "bottom",
+                                    "weaker"]):
+        direction = "ASC"
+
+    # Apply ORDER BY only if sorting intent exists
+    if direction:
+        alias = select_entry.get("alias", "value")
+        plan["order_by"] = [{"column": alias, "direction": direction}]
 
     return plan
