@@ -1,4 +1,3 @@
-# agent.py
 from groq import Groq
 import os
 import json
@@ -27,13 +26,11 @@ def load_sql_schema():
             timeout=5
         )
         cursor = conn.cursor()
-        cursor.execute(
-            f"""
+        cursor.execute(f"""
             SELECT COLUMN_NAME, DATA_TYPE
             FROM INFORMATION_SCHEMA.COLUMNS
             WHERE TABLE_NAME = '{TABLE_NAME}'
-            """
-        )
+        """)
         schema = {row.COLUMN_NAME: row.DATA_TYPE.lower() for row in cursor.fetchall()}
         conn.close()
         return schema
@@ -42,6 +39,7 @@ def load_sql_schema():
         return {}
 
 _SCHEMA = {}
+
 def get_schema():
     global _SCHEMA
     if not _SCHEMA:
@@ -60,6 +58,7 @@ def categorical_columns():
         c for c, t in schema.items()
         if c not in nums and t not in ('date', 'datetime', 'smalldatetime', 'datetime2')
     ]
+
 
 # --------------------------------
 # Business metric rules
@@ -80,7 +79,7 @@ BUSINESS_METRICS = {
         "alias": "total_cost"
     },
     "profit": {
-        "keywords": ["profit", "jobprofit", "margin"],
+        "keywords": ["profit", "margin", "jobprofit"],
         "expression": "[JobProfit]",
         "base_column": "JobProfit",
         "default_agg": "sum",
@@ -88,37 +87,40 @@ BUSINESS_METRICS = {
     }
 }
 
+
 # --------------------------------
 # Time parsing helper
 # --------------------------------
 def parse_time_from_text(question: str):
     q = question.lower()
     now = datetime.utcnow()
-    res = {"year": None, "quarter": None, "month": None, "timeframe": None}
 
-    m = re.search(r'\b(20\d{2})\b', q)
+    result = {"year": None, "quarter": None, "month": None}
+
+    m = re.search(r"\b(20\d{2})\b", q)
     if m:
-        res["year"] = int(m.group(1))
+        result["year"] = int(m.group(1))
 
     if "last year" in q or "previous year" in q:
-        res["year"] = now.year - 1
+        result["year"] = now.year - 1
 
     if "last quarter" in q or "previous quarter" in q:
         current_q = (now.month - 1) // 3 + 1
         prev_q = current_q - 1 or 4
         prev_y = now.year - 1 if prev_q == 4 else now.year
-        res["quarter"] = prev_q
-        res["year"] = prev_y
+        result["quarter"] = prev_q
+        result["year"] = prev_y
 
-    m = re.search(r'(?:q|quarter)[^\d]*([1-4])(?:[^0-9]+(20\d{2}))?', q)
+    m = re.search(r"(?:q|quarter)[^\d]*([1-4])(?:[^0-9]+(20\d{2}))?", q)
     if m:
-        res["quarter"] = int(m.group(1))
-        if m.group(2): res["year"] = int(m.group(2))
+        result["quarter"] = int(m.group(1))
+        if m.group(2):
+            result["year"] = int(m.group(2))
 
     if "last month" in q:
         prev = now.replace(day=1) - timedelta(days=1)
-        res["month"] = prev.month
-        res["year"] = prev.year
+        result["month"] = prev.month
+        result["year"] = prev.year
 
     months = {
         name: idx for idx, name in enumerate([
@@ -128,134 +130,135 @@ def parse_time_from_text(question: str):
     }
     for name, idx in months.items():
         if name and name in q:
-            res["month"] = idx
-            if not res["year"]: res["year"] = now.year
+            result["month"] = idx
+            if not result["year"]:
+                result["year"] = now.year
 
-    return res
+    return result
+
 
 # --------------------------------
-# Detect top N
+# Top N detection
 # --------------------------------
 def detect_top_n(question: str):
-    q = question.lower()
-    m = re.search(r'top\s+(\d+)', q)
-    if m: return int(m.group(1))
-    return None
+    m = re.search(r"top\s+(\d+)", question.lower())
+    return int(m.group(1)) if m else None
+
 
 # --------------------------------
-# Detect dimension filters
+# Dimension filters
 # --------------------------------
 def detect_dimension_filters(question: str):
     q = question.lower()
     filters = []
 
-    # Transport mode
-    tmodes = ["air", "sea", "roa", "cou", "noj", "fsa"]
-    for mode in tmodes:
+    transport_modes = ["air", "sea", "roa", "cou", "noj", "fsa"]
+
+    for mode in transport_modes:
         if f" {mode} " in q or q.endswith(mode):
             filters.append({"column": "TransportMode", "operator": "=", "value": mode.upper()})
 
-    # Customer
-    m = re.search(r"customer\s+([a-z0-9 _-]+)", q)
-    if m:
-        filters.append({"column": "CustomerName",
-                        "operator": "=",
-                        "value": m.group(1).strip()})
-
-    # Country
-    m = re.search(r"country\s+([a-z0-9 _-]+)", q)
-    if m:
-        filters.append({"column": "CountryName",
-                        "operator": "=",
-                        "value": m.group(1).strip()})
-
     return filters
 
+
 # --------------------------------
-# Detect metric
+# BUSINESS METRIC detection
 # --------------------------------
 def detect_business_metric_key(question: str):
     q = question.lower()
     for key, meta in BUSINESS_METRICS.items():
-        for kw in meta["keywords"]:
-            if kw in q:
+        for word in meta["keywords"]:
+            if word in q:
                 return key
     return None
+
 
 def detect_metric_column(question: str):
     q = question.lower()
     nums = numeric_columns()
 
-    if "profit" in q: return "JobProfit"
-    if "revenue" in q: return "REVAmount"
+    if "profit" in q:
+        return "JobProfit"
+    if "revenue" in q:
+        return "REVAmount"
+
     return nums[0] if nums else None
 
+
 # --------------------------------
-# FIXED GROUPING LOGIC
+# UPDATED GROUPING LOGIC (Fix)
 # --------------------------------
 def detect_group_column(question: str):
     q = question.lower()
     cats = categorical_columns()
 
-    # NEW: smart grouping rules
-    if any(word in q for word in ["each customer", "per customer", "customer wise", "customer-wise", "customers wise"]):
-        return "CustomerName"
+    DIRECT_MAP = {
+        "customer": "CustomerName",
+        "branch": "BranchCode",
+        "company": "CompanyCode",
+        "department": "DeptCode",
+        "country": "CountryName",
+        "transport": "TransportMode",
+        "transport mode": "TransportMode",
+        "customer group": "CustomerGroupName",
+        "lead group": "CustomerLeadGroupName",
+        "product": "ProductLevel1",
+        "product level 1": "ProductLevel1",
+        "product level 2": "ProductLevel2",
+        "product level 3": "ProductLevel3"
+    }
 
-    if any(word in q for word in ["each transport", "transport wise", "per transport", "mode wise", "transport mode wise"]):
-        return "TransportMode"
+    for key, col in DIRECT_MAP.items():
+        if key in q and col in cats:
+            return col
 
-    # Existing logic
-    if "by transport" in q and "TransportMode" in cats: return "TransportMode"
-    if "by customer" in q and "CustomerName" in cats: return "CustomerName"
-    if "by product" in q and "ProductLevel1" in cats: return "ProductLevel1"
-
-    m = re.search(r'by\s+([a-z0-9 _-]+)', q)
+    m = re.search(r"\b(by|each|per)\s+([a-z0-9 _-]+)", q)
     if m:
-        target = m.group(1).replace(" ", "").lower()
-        for c in cats:
-            if target in c.lower():
-                return c
+        target = m.group(2).strip().replace(" ", "").lower()
+        for col in cats:
+            if target in col.lower().replace(" ", ""):
+                return col
 
     return None
 
-# --------------------------------
-# Groq
-# --------------------------------
-def get_client():
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key: return None
-    return Groq(api_key=api_key)
 
 # --------------------------------
-# Build plan
+# Groq client
+# --------------------------------
+def get_client():
+    key = os.getenv("GROQ_API_KEY")
+    return Groq(api_key=key) if key else None
+
+
+# --------------------------------
+# MAIN: Convert question → Plan
 # --------------------------------
 def extract_query(question: str):
     schema = get_schema()
     nums = numeric_columns()
     cats = categorical_columns()
+
     time_ctx = parse_time_from_text(question)
 
-    q_lower = question.lower()
+    metric_key = detect_business_metric_key(question)
+    metric_meta = BUSINESS_METRICS.get(metric_key) if metric_key else None
 
-    # Metric selection
-    bm_key = detect_business_metric_key(question)
-    bm_meta = BUSINESS_METRICS.get(bm_key) if bm_key else None
-    agg = bm_meta["default_agg"] if bm_meta else "sum"
+    agg = metric_meta["default_agg"] if metric_meta else "sum"
 
-    if bm_meta:
+    if metric_meta:
         select_entry = {
-            "column": bm_meta["base_column"],
-            "expression": bm_meta["expression"],
+            "column": metric_meta["base_column"],
+            "expression": metric_meta["expression"],
             "aggregation": agg,
-            "alias": bm_meta["alias"],
+            "alias": metric_meta["alias"]
         }
     else:
-        metric_col = detect_metric_column(question)
+        col = detect_metric_column(question)
         select_entry = {
-            "column": metric_col,
+            "column": col,
             "expression": None,
             "aggregation": agg,
-            "alias": metric_col,
+            "alias": col
         }
 
     group_col = detect_group_column(question)
@@ -269,7 +272,6 @@ def extract_query(question: str):
         "limit": top_n
     }
 
-    # Time filters
     if time_ctx["year"]:
         plan["filters"].append({"column": "FinancialYear", "operator": "=", "value": time_ctx["year"]})
     if time_ctx["quarter"]:
@@ -277,7 +279,8 @@ def extract_query(question: str):
     if time_ctx["month"]:
         plan["filters"].append({"column": "FinancialMonth", "operator": "=", "value": time_ctx["month"]})
 
-    # Dimension filters
-    plan["filters"].extend(detect_dimension_filters(question))
+    dim_filters = detect_dimension_filters(question)
+    if dim_filters:
+        plan["filters"].extend(dim_filters)
 
     return plan
