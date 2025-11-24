@@ -15,7 +15,6 @@ TABLE_NAME = "WBI_BI_Data_V2"
 # Load schema from SQL Server
 # --------------------------------
 def load_sql_schema():
-    """Read INFORMATION_SCHEMA for the target table."""
     try:
         conn = pyodbc.connect(
             f"DRIVER={{ODBC Driver 18 for SQL Server}};"
@@ -63,7 +62,7 @@ def categorical_columns():
     ]
 
 # --------------------------------
-# Business metric rules (Option A)
+# Business metric rules
 # --------------------------------
 BUSINESS_METRICS = {
     "revenue": {
@@ -88,18 +87,6 @@ BUSINESS_METRICS = {
         "alias": "total_profit"
     }
 }
-
-BUSINESS_RULES_TEXT = """
-Business rules:
-- Revenue = REVAmount + WIPAmount
-- Cost = CSTAmount + ACRAmount
-- Profit = JobProfit
-"""
-
-COLUMN_DESCRIPTIONS_TEXT = """
-Important columns include TransactionMonth, FinancialMonth, CustomerName,
-CountryName, TransportMode, ProductLevel1-3, etc.
-"""
 
 # --------------------------------
 # Time parsing helper
@@ -156,7 +143,7 @@ def detect_top_n(question: str):
     return None
 
 # --------------------------------
-# NEW: Detect dimension filters (Fix)
+# Detect dimension filters
 # --------------------------------
 def detect_dimension_filters(question: str):
     q = question.lower()
@@ -173,19 +160,19 @@ def detect_dimension_filters(question: str):
     if m:
         filters.append({"column": "CustomerName",
                         "operator": "=",
-                        "value": m.group(1).strip().upper()})
+                        "value": m.group(1).strip()})
 
     # Country
     m = re.search(r"country\s+([a-z0-9 _-]+)", q)
     if m:
         filters.append({"column": "CountryName",
                         "operator": "=",
-                        "value": m.group(1).strip().upper()})
+                        "value": m.group(1).strip()})
 
     return filters
 
 # --------------------------------
-# Metric detection
+# Detect metric
 # --------------------------------
 def detect_business_metric_key(question: str):
     q = question.lower()
@@ -201,13 +188,23 @@ def detect_metric_column(question: str):
 
     if "profit" in q: return "JobProfit"
     if "revenue" in q: return "REVAmount"
-
     return nums[0] if nums else None
 
+# --------------------------------
+# FIXED GROUPING LOGIC
+# --------------------------------
 def detect_group_column(question: str):
     q = question.lower()
     cats = categorical_columns()
 
+    # NEW: smart grouping rules
+    if any(word in q for word in ["each customer", "per customer", "customer wise", "customer-wise", "customers wise"]):
+        return "CustomerName"
+
+    if any(word in q for word in ["each transport", "transport wise", "per transport", "mode wise", "transport mode wise"]):
+        return "TransportMode"
+
+    # Existing logic
     if "by transport" in q and "TransportMode" in cats: return "TransportMode"
     if "by customer" in q and "CustomerName" in cats: return "CustomerName"
     if "by product" in q and "ProductLevel1" in cats: return "ProductLevel1"
@@ -218,10 +215,11 @@ def detect_group_column(question: str):
         for c in cats:
             if target in c.lower():
                 return c
+
     return None
 
 # --------------------------------
-# Groq Client
+# Groq
 # --------------------------------
 def get_client():
     api_key = os.getenv("GROQ_API_KEY")
@@ -229,7 +227,7 @@ def get_client():
     return Groq(api_key=api_key)
 
 # --------------------------------
-# MAIN: Convert question → SQL plan
+# Build plan
 # --------------------------------
 def extract_query(question: str):
     schema = get_schema()
@@ -239,9 +237,9 @@ def extract_query(question: str):
 
     q_lower = question.lower()
 
+    # Metric selection
     bm_key = detect_business_metric_key(question)
     bm_meta = BUSINESS_METRICS.get(bm_key) if bm_key else None
-
     agg = bm_meta["default_agg"] if bm_meta else "sum"
 
     if bm_meta:
@@ -271,7 +269,7 @@ def extract_query(question: str):
         "limit": top_n
     }
 
-    # ---- TIME FILTERS ----
+    # Time filters
     if time_ctx["year"]:
         plan["filters"].append({"column": "FinancialYear", "operator": "=", "value": time_ctx["year"]})
     if time_ctx["quarter"]:
@@ -279,9 +277,7 @@ def extract_query(question: str):
     if time_ctx["month"]:
         plan["filters"].append({"column": "FinancialMonth", "operator": "=", "value": time_ctx["month"]})
 
-    # ---- NEW: apply dimension filters ----
-    dim_filters = detect_dimension_filters(question)
-    if dim_filters:
-        plan["filters"].extend(dim_filters)
+    # Dimension filters
+    plan["filters"].extend(detect_dimension_filters(question))
 
     return plan
