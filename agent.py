@@ -15,6 +15,7 @@ TABLE_NAME = "WBI_BI_Data_V2"
 # Load schema from SQL Server
 # --------------------------------
 def load_sql_schema():
+    """Read INFORMATION_SCHEMA for the target table."""
     try:
         conn = pyodbc.connect(
             f"DRIVER={{ODBC Driver 18 for SQL Server}};"
@@ -57,16 +58,18 @@ def numeric_columns():
 
 
 def categorical_columns():
+    """Treat everything that is not numeric/date as a dimension."""
     schema = get_schema()
     nums = set(numeric_columns())
-    return [
+    cats = [
         c for c, t in schema.items()
         if c not in nums and t not in ('date', 'datetime', 'smalldatetime', 'datetime2')
     ]
+    return cats
 
 
 # --------------------------------
-# Business metric rules
+# Business metrics (Option A with SQL expression)
 # --------------------------------
 BUSINESS_METRICS = {
     "revenue": {
@@ -84,47 +87,50 @@ BUSINESS_METRICS = {
         "alias": "total_cost"
     },
     "profit": {
-        "keywords": ["profit", "margin"],
+        "keywords": ["profit", "margin", "jobprofit"],
         "expression": "[JobProfit]",
         "base_column": "JobProfit",
         "default_agg": "sum",
         "alias": "total_profit"
-    }
+    },
 }
 
 BUSINESS_RULES_TEXT = """
-Revenue = REVAmount + WIPAmount
-Cost = CSTAmount + ACRAmount
-Profit = JobProfit
+Business metric rules:
+- Revenue = REVAmount + WIPAmount
+- Cost = CSTAmount + ACRAmount
+- Profit = JobProfit
+
+Time:
+- FinancialMonth runs from Apr(1) to Mar(12)
 """
 
 COLUMN_DESCRIPTIONS_TEXT = """
-TransportMode, ProductLevel, Customer, Country fields...
+TransportMode = AIR, SEA, COU, ROA, NOJ, FSA
+ProductLevel1: Air Export, Sea Import, etc.
+CustomerName, CountryName, BranchCode etc.
+All shipment financial metrics available.
 """
 
 
 # --------------------------------
-# Updated Time Parsing (Fiscal Month March→Feb)
+# Time parsing helper
 # --------------------------------
 def parse_time_from_text(question: str):
     q = question.lower()
     now = datetime.utcnow()
-
     res = {"year": None, "quarter": None, "month": None, "timeframe": None}
 
-    # Detect explicit year
     m = re.search(r'\b(20\d{2})\b', q)
     if m:
         res["year"] = int(m.group(1))
 
-    # Last year
-    if "last year" in q or "previous year" in q:
+    if 'previous year' in q or 'last year' in q:
         res["year"] = now.year - 1
         res["timeframe"] = "previous_year"
 
-    # Last quarter
-    if "last quarter" in q or "previous quarter" in q:
-        current_q = (now.month - 1)//3 + 1
+    if 'last quarter' in q or 'previous quarter' in q:
+        current_q = (now.month - 1) // 3 + 1
         prev_q = current_q - 1
         prev_year = now.year
         if prev_q == 0:
@@ -132,36 +138,29 @@ def parse_time_from_text(question: str):
             prev_year -= 1
         res["quarter"] = prev_q
         res["year"] = prev_year
+        res["timeframe"] = "last_quarter"
 
-    # Explicit quarter
-    m = re.search(r'(?:q|quarter)[^\d]*([1-4])', q)
+    m = re.search(r'(?:q|quarter)[^\d]*([1-4])(?:[^0-9]+(20\d{2}))?', q)
     if m:
         res["quarter"] = int(m.group(1))
+        if m.group(2):
+            res["year"] = int(m.group(2))
 
-    # Last month
-    if "last month" in q or "previous month" in q:
+    if 'last month' in q or 'previous month' in q:
         prev = now.replace(day=1) - timedelta(days=1)
         res["month"] = prev.month
         res["year"] = prev.year
+        res["timeframe"] = "last_month"
 
-    # 🔥 Fiscal Year Month Mapping (NEW)
-    fiscal_month_map = {
-        "march": 1,
-        "april": 2,
-        "may": 3,
-        "june": 4,
-        "july": 5,
-        "august": 6,
-        "september": 7,
-        "october": 8,
-        "november": 9,
-        "december": 10,
-        "january": 11,
-        "february": 12
+    months = {
+        name.lower(): idx
+        for idx, name in enumerate(
+            ["", "january","february","march","april","may","june",
+             "july","august","september","october","november","december"]
+        )
     }
-
-    for name, idx in fiscal_month_map.items():
-        if name in q:
+    for name, idx in months.items():
+        if name and name in q:
             res["month"] = idx
             if not res["year"]:
                 res["year"] = now.year
@@ -171,26 +170,31 @@ def parse_time_from_text(question: str):
 
 
 # --------------------------------
-# Top N detection
+# Detect top N
 # --------------------------------
 def detect_top_n(question: str):
     q = question.lower()
     m = re.search(r'top\s+(\d+)', q)
-    if m: return int(m.group(1))
-    m = re.search(r'first\s+(\d+)', q)
-    if m: return int(m.group(1))
+    if m:
+        return int(m.group(1))
     return None
 
 
+# --------------------------------
+# Detect business metric key
+# --------------------------------
 def detect_business_metric_key(question: str):
     q = question.lower()
     for key, meta in BUSINESS_METRICS.items():
-        for kw in meta["keywords"]:
+        for kw in meta.get("keywords", []):
             if kw in q:
                 return key
     return None
 
 
+# --------------------------------
+# Detect fallback numeric metric
+# --------------------------------
 def detect_metric_column(question: str):
     q = question.lower()
     nums = numeric_columns()
@@ -202,35 +206,71 @@ def detect_metric_column(question: str):
 
     if "profit" in q and "JobProfit" in schema:
         return "JobProfit"
-
     if ("revenue" in q or "sales" in q) and "REVAmount" in schema:
         return "REVAmount"
 
     return nums[0] if nums else None
 
 
+# --------------------------------
+# Detect group column
+# --------------------------------
 def detect_group_column(question: str):
     q = question.lower()
     cats = categorical_columns()
 
-    m = re.search(r'by\s+([a-z0-9 _-]+)', q)
+    m = re.search(r'\bby\s+([a-z0-9 _-]{1,40})', q)
     if m:
-        cand = m.group(1).strip().replace(" ", "").lower()
+        candidate = m.group(1).strip()
+        cand2 = candidate.replace(" ", "").lower()
         for col in cats:
-            if cand in col.lower():
+            if cand2 in col.lower():
                 return col
 
-    if "transport" in q and "TransportMode" in cats:
-        return "TransportMode"
+    if 'transport' in q and 'TransportMode' in cats:
+        return 'TransportMode'
 
-    if "customer" in q and "CustomerName" in cats:
-        return "CustomerName"
+    if 'customer' in q and 'CustomerName' in cats:
+        return 'CustomerName'
+
+    if 'country' in q and 'CountryName' in cats:
+        return 'CountryName'
 
     return None
 
 
 # --------------------------------
-# Groq Client
+# Detect category VALUE (AIR / SEA / INDIA / XYZ)
+# --------------------------------
+def detect_category_value(question: str, group_col: str):
+    if not group_col:
+        return None
+
+    q = question.lower()
+
+    # direct: "transport mode air"
+    m = re.search(rf"{group_col.lower()}[^\w]+([a-z0-9 _-]+)", q)
+    if m:
+        return m.group(1).strip().upper()
+
+    # general: "for air", "for india"
+    m = re.search(r"for\s+([a-z0-9 _-]+)", q)
+    if m:
+        value = m.group(1).strip().upper()
+        if "YEAR" not in value and "MONTH" not in value:
+            return value
+
+    # special list for transport codes
+    transport_codes = ["AIR", "SEA", "COU", "ROA", "NOJ", "FSA"]
+    for code in transport_codes:
+        if code.lower() in q:
+            return code
+
+    return None
+
+
+# --------------------------------
+# Groq client
 # --------------------------------
 def get_client():
     api_key = os.getenv("GROQ_API_KEY")
@@ -240,7 +280,7 @@ def get_client():
 
 
 # --------------------------------
-# Build query plan
+# Main: question → plan
 # --------------------------------
 def extract_query(question: str):
     schema = get_schema()
@@ -249,14 +289,17 @@ def extract_query(question: str):
     time_ctx = parse_time_from_text(question)
     q_lower = question.lower()
 
-    # Business Metric?
     bm_key = detect_business_metric_key(question)
     bm_meta = BUSINESS_METRICS.get(bm_key) if bm_key else None
 
     agg = "sum"
-    if "avg" in q_lower: agg = "avg"
-    if "count" in q_lower: agg = "count"
+    if "avg" in q_lower or "average" in q_lower:
+        agg = "avg"
 
+    if "count" in q_lower:
+        agg = "count"
+
+    # build select
     if bm_meta:
         select_entry = {
             "column": bm_meta["base_column"],
@@ -266,35 +309,57 @@ def extract_query(question: str):
             "metric_key": bm_key
         }
     else:
-        metric_col = detect_metric_column(question)
+        col = detect_metric_column(question)
         select_entry = {
-            "column": metric_col,
+            "column": col,
             "expression": None,
             "aggregation": agg,
-            "alias": metric_col,
-            "metric_key": None
+            "alias": col
         }
 
     group_col = detect_group_column(question)
+    category_value = detect_category_value(question, group_col)
     top_n = detect_top_n(question)
 
     plan = {
         "select": [select_entry],
         "filters": [],
-        "group_by": [group_col] if group_col else [],
+        "group_by": [],
+        "category_value": category_value,
         "order_by": [],
         "limit": top_n
     }
 
-    # Inject Time Filters
-    filters = []
-    if time_ctx.get("year"):
-        filters.append({"column": "FinancialYear", "operator": "=", "value": time_ctx["year"]})
-    if time_ctx.get("quarter"):
-        filters.append({"column": "FinancialQuarter", "operator": "=", "value": time_ctx["quarter"]})
-    if time_ctx.get("month"):
-        filters.append({"column": "FinancialMonth", "operator": "=", "value": time_ctx["month"]})
+    # If user specifies a value → DO NOT group
+    if group_col and not category_value:
+        plan["group_by"] = [group_col]
 
-    plan["filters"] = filters
+    # If value exists → add filter
+    if group_col and category_value:
+        plan["filters"].append({
+            "column": group_col,
+            "operator": "=",
+            "value": category_value
+        })
+
+    # Inject time filters
+    if time_ctx["year"]:
+        plan["filters"].append({
+            "column": "FinancialYear",
+            "operator": "=",
+            "value": time_ctx["year"]
+        })
+    if time_ctx["quarter"]:
+        plan["filters"].append({
+            "column": "FinancialQuarter",
+            "operator": "=",
+            "value": time_ctx["quarter"]
+        })
+    if time_ctx["month"]:
+        plan["filters"].append({
+            "column": "FinancialMonth",
+            "operator": "=",
+            "value": time_ctx["month"]
+        })
 
     return plan
