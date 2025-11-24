@@ -1,108 +1,78 @@
 # sql_builder.py
+import re
 
-def build_sql_from_plan(plan, table_name, schema):
-    """
-    Convert the generic JSON plan into an executable SQL + parameter list.
-
-    Supports:
-    - Business metric expressions (e.g. REVAmount + WIPAmount)
-    - Normal column aggregates
-    - WHERE filters
-    - GROUP BY
-    - ORDER BY
-    - LIMIT / TOP
-    """
-
+def build_sql_from_plan(plan, table, schema):
     selects = plan.get("select", [])
     filters = plan.get("filters", [])
     group_by = plan.get("group_by", [])
     order_by = plan.get("order_by", [])
-    limit = plan.get("limit", None)
+    limit = plan.get("limit")
 
     sql_select_parts = []
-    columns_out = []
 
-    # ---------------------------------------------------
-    # SELECT clause
-    # ---------------------------------------------------
+    # --- 1. Include GROUP BY columns in SELECT ---
+    for col in group_by:
+        if col in schema:
+            sql_select_parts.append(f"[{col}]")
+
+    # --- 2. Add metric columns or expressions ---
     for sel in selects:
         col = sel.get("column")
         expr = sel.get("expression")
-        agg = sel.get("aggregation", "sum").upper()
+        agg = sel.get("aggregation", "sum")
         alias = sel.get("alias", "value")
 
-        if expr:  
-            # Business metric expression
+        if expr:
             sql_select_parts.append(f"{agg}({expr}) AS [{alias}]")
-            columns_out.append(alias)
-        else:
-            # Normal column
+        elif col:
             sql_select_parts.append(f"{agg}([{col}]) AS [{alias}]")
-            columns_out.append(alias)
 
+    # Safety fallback
     if not sql_select_parts:
         raise Exception("No valid select expressions in plan")
 
-    select_sql = ", ".join(sql_select_parts)
+    sql = f"SELECT {', '.join(sql_select_parts)} FROM {table}"
 
-    # ---------------------------------------------------
-    # WHERE clause
-    # ---------------------------------------------------
+    # --- 3. WHERE clause ---
     where_clauses = []
     params = []
 
-    for f in filters:
-        col = f.get("column")
-        op = f.get("operator", "=")
-        val = f.get("value")
+    for flt in filters:
+        col = flt.get("column")
+        op = flt.get("operator", "=")
+        val = flt.get("value")
 
-        if op.lower() == "in" and isinstance(val, list):
-            placeholders = ",".join(["?"] * len(val))
-            where_clauses.append(f"[{col}] IN ({placeholders})")
-            params.extend(val)
-        else:
+        if col and col in schema:
             where_clauses.append(f"[{col}] {op} ?")
             params.append(val)
 
-    where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
+    if where_clauses:
+        sql += " WHERE " + " AND ".join(where_clauses)
 
-    # ---------------------------------------------------
-    # GROUP BY
-    # ---------------------------------------------------
+    # --- 4. GROUP BY ---
     if group_by:
-        group_sql = " GROUP BY " + ", ".join([f"[{g}]" for g in group_by])
-    else:
-        group_sql = ""
+        sql += " GROUP BY " + ", ".join(f"[{c}]" for c in group_by)
 
-    # ---------------------------------------------------
-    # ORDER BY
-    # ---------------------------------------------------
+    # --- 5. ORDER BY ---
     if order_by:
-        ob_parts = []
-        for ob in order_by:
-            col = ob.get("column")
-            direction = ob.get("direction", "DESC").upper()
-            ob_parts.append(f"[{col}] {direction}")
-        order_sql = " ORDER BY " + ", ".join(ob_parts)
-    else:
-        order_sql = ""
+        sql += " ORDER BY " + ", ".join(
+            f"[{ob['column']}] {ob.get('direction', 'DESC')}"
+            for ob in order_by
+        )
 
-    # ---------------------------------------------------
-    # LIMIT / TOP
-    # ---------------------------------------------------
-    top_sql = ""
-    if isinstance(limit, int) and limit > 0:
-        top_sql = f"TOP {limit} "
+    # --- 6. LIMIT (TOP N) ---
+    if limit:
+        sql = f"SELECT TOP {limit} " + sql[7:]  # replace initial SELECT
 
-    # ---------------------------------------------------
-    # Final SQL
-    # ---------------------------------------------------
-    sql = f"""
-    SELECT {top_sql}{select_sql}
-    FROM {table_name}
-    WHERE {where_sql}
-    {group_sql}
-    {order_sql}
-    """.strip()
+    # Return SQL + parameters + columns list for UI
+    columns = []
 
-    return sql, params, columns_out
+    for col in group_by:
+        columns.append(col)
+
+    for sel in selects:
+        alias = sel.get("alias")
+        if alias:
+            columns.append(alias)
+
+    return sql, params, columns
