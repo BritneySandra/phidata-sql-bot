@@ -1,10 +1,12 @@
-# agent.py — Fully Dynamic LLM SQL Agent (Updated Version)
-# ---------------------------------------------------------
-# Fixes added:
-# 1. JSON-only extraction (ignores LLM explanations)
-# 2. Percent (%) sanitizer to avoid pyodbc "Invalid format specifier"
-# 3. Robust JSON parsing
-# ---------------------------------------------------------
+# agent.py — Fully Dynamic LLM SQL Agent (Updated + Latest Groq Model)
+# --------------------------------------------------------------------
+# Improvements:
+# ✔ Replaced deprecated model with "llama-3.1-70b-versatile"
+# ✔ JSON extraction guard
+# ✔ % sanitizer (avoids pyodbc "Invalid format specifier")
+# ✔ Robust JSON parsing
+# ✔ No hardcoded business rules (everything loaded dynamically)
+# --------------------------------------------------------------------
 
 import os
 import json
@@ -81,7 +83,7 @@ METRICS = load_metrics()
 
 
 # ------------------------------------------------------
-# LLM client
+# LLM Client
 # ------------------------------------------------------
 def get_client():
     api_key = os.getenv("GROQ_API_KEY")
@@ -89,7 +91,7 @@ def get_client():
 
 
 # ------------------------------------------------------
-# Build prompt for LLM
+# Build Prompt
 # ------------------------------------------------------
 def build_prompt(question, schema, metadata, metrics):
 
@@ -144,7 +146,7 @@ FORMAT:
 
 
 # ------------------------------------------------------
-# Extract Query via LLM
+# Extract Query Using LLM
 # ------------------------------------------------------
 def extract_query(question: str):
     schema = get_schema()
@@ -153,11 +155,10 @@ def extract_query(question: str):
     if not client:
         return {"error": "Missing GROQ_API_KEY"}
 
-    # Send prompt
     prompt = build_prompt(question, schema, METADATA, METRICS)
 
     response = client.chat.completions.create(
-        model="llama3-70b-8192",
+        model="llama-3.1-70b-versatile",   # ⭐ UPDATED MODEL
         messages=[{"role": "user", "content": prompt}],
         temperature=0
     )
@@ -165,7 +166,7 @@ def extract_query(question: str):
     raw = response.choices[0].message["content"].strip()
 
     # ----------------------------
-    # STEP 1: Only keep JSON {...}
+    # STEP 1 — Extract JSON only
     # ----------------------------
     json_start = raw.find("{")
     json_end = raw.rfind("}")
@@ -178,13 +179,13 @@ def extract_query(question: str):
 
     json_text = raw[json_start:json_end + 1]
 
-    # ----------------------------------------------------
-    # STEP 2: FIX — Remove '%' to avoid SQL format errors
-    # ----------------------------------------------------
+    # --------------------------------------------------------
+    # STEP 2 — Fix problematic characters (percent sanitizer)
+    # --------------------------------------------------------
     json_text = json_text.replace("%", "_pct")
 
     # ----------------------------------------------
-    # STEP 3: Attempt JSON parse
+    # STEP 3 — Parse JSON safely
     # ----------------------------------------------
     try:
         plan = json.loads(json_text)
@@ -192,7 +193,7 @@ def extract_query(question: str):
 
     except Exception as e:
         return {
-            "error": f"Failed to parse LLM JSON: {e}",
+            "error": f"Failed to parse JSON: {e}",
             "json_received": json_text,
             "raw_response": raw
         }
