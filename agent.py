@@ -1,15 +1,20 @@
-from groq import Groq
+# agent.py — Fully Dynamic LLM SQL Agent
+# -----------------------------------------------------
+# This version removes all manual hardcoded logic.
+# The LLM uses schema + metadata.json + metrics.json
+# to dynamically infer filters, grouping, metrics,
+# top N, comparisons, trends, periods, etc.
+# -----------------------------------------------------
+
 import os
 import json
 import pyodbc
 from dotenv import load_dotenv
-import re
-from datetime import datetime, timedelta
+from groq import Groq
 
 load_dotenv()
 
 TABLE_NAME = "WBI_BI_Data_V2"
-
 
 # ------------------------------------------------------
 # Load SQL Schema
@@ -22,25 +27,21 @@ def load_sql_schema():
             f"DATABASE={os.getenv('SQL_DATABASE')};"
             f"UID={os.getenv('SQL_USERNAME')};"
             f"PWD={os.getenv('SQL_PASSWORD')};"
-            f"Encrypt=no;"
-            f"TrustServerCertificate=yes;",
+            f"Encrypt=no;TrustServerCertificate=yes;",
             timeout=5
         )
         cursor = conn.cursor()
-        cursor.execute(
-            f"""
+        cursor.execute(f"""
             SELECT COLUMN_NAME, DATA_TYPE
             FROM INFORMATION_SCHEMA.COLUMNS
             WHERE TABLE_NAME = '{TABLE_NAME}'
-            """
-        )
+        """)
         schema = {row.COLUMN_NAME: row.DATA_TYPE.lower() for row in cursor.fetchall()}
         conn.close()
         return schema
     except Exception as e:
-        print("⚠ SQL schema load failed:", e)
+        print("❌ Failed to load SQL schema:", e)
         return {}
-
 
 _SCHEMA = {}
 
@@ -51,227 +52,32 @@ def get_schema():
     return _SCHEMA
 
 
-def numeric_columns():
-    schema = get_schema()
-    return [
-        c for c, t in schema.items()
-        if t in ('decimal', 'numeric', 'money', 'float', 'int', 'bigint', 'smallint')
-    ]
+# ------------------------------------------------------
+# Load metadata.json (column descriptions)
+# ------------------------------------------------------
+def load_metadata():
+    try:
+        with open("metadata.json", "r") as f:
+            return json.load(f)
+    except Exception as e:
+        print("❌ Cannot load metadata.json:", e)
+        return {}
 
-
-def categorical_columns():
-    schema = get_schema()
-    nums = set(numeric_columns())
-    return [
-        c for c, t in schema.items()
-        if c not in nums and t not in ('date', 'datetime', 'smalldatetime', 'datetime2')
-    ]
+METADATA = load_metadata()
 
 
 # ------------------------------------------------------
-# Business Metrics (Option A)
+# Load metrics.json (business rules)
 # ------------------------------------------------------
-BUSINESS_METRICS = {
-    "revenue": {
-        "keywords": ["revenue", "total revenue", "sales", "turnover", "income"],
-        "expression": "[REVAmount] + [WIPAmount]",
-        "base_column": "REVAmount",
-        "default_agg": "sum",
-        "alias": "total_revenue"
-    },
-    "cost": {
-        "keywords": ["cost", "total cost", "expense"],
-        "expression": "[CSTAmount] + [ACRAmount]",
-        "base_column": "CSTAmount",
-        "default_agg": "sum",
-        "alias": "total_cost"
-    },
-    "profit": {
-        "keywords": ["profit", "jobprofit", "margin"],
-        "expression": "[JobProfit]",
-        "base_column": "JobProfit",
-        "default_agg": "sum",
-        "alias": "total_profit"
-    }
-}
+def load_metrics():
+    try:
+        with open("metrics.json", "r") as f:
+            return json.load(f)
+    except Exception as e:
+        print("❌ Cannot load metrics.json:", e)
+        return {}
 
-
-# ------------------------------------------------------
-# Time Parsing
-# ------------------------------------------------------
-def parse_time_from_text(question: str):
-    q = question.lower()
-    now = datetime.utcnow()
-
-    res = {"year": None, "quarter": None, "month": None, "timeframe": None}
-
-    # explicit year
-    m = re.search(r'\b(20\d{2})\b', q)
-    if m:
-        res["year"] = int(m.group(1))
-
-    # last year
-    if "last year" in q or "previous year" in q:
-        res["year"] = now.year - 1
-
-    # last quarter
-    if "last quarter" in q or "previous quarter" in q:
-        current_q = (now.month - 1) // 3 + 1
-        prev_q = current_q - 1 or 4
-        prev_y = now.year - 1 if prev_q == 4 else now.year
-        res["quarter"] = prev_q
-        res["year"] = prev_y
-
-    # explicit quarter
-    m = re.search(r'(?:q|quarter)[^\d]*([1-4])(?:[^0-9]+(20\d{2}))?', q)
-    if m:
-        res["quarter"] = int(m.group(1))
-        if m.group(2):
-            res["year"] = int(m.group(2))
-
-    # last month
-    if "last month" in q:
-        prev = now.replace(day=1) - timedelta(days=1)
-        res["month"] = prev.month
-        res["year"] = prev.year
-
-    # explicit month name
-    months = {m: i for i, m in enumerate(
-        ["", "january", "february", "march", "april", "may", "june",
-         "july", "august", "september", "october", "november", "december"]
-    )}
-    for name, idx in months.items():
-        if name and name in q:
-            res["month"] = idx
-            if not res["year"]:
-                res["year"] = now.year
-
-    return res
-
-
-# ------------------------------------------------------
-# Detect Top N
-# ------------------------------------------------------
-def detect_top_n(question: str):
-    q = question.lower()
-    m = re.search(r'top\s+(\d+)', q)
-    if m:
-        return int(m.group(1))
-    return None
-
-
-# ------------------------------------------------------
-# Detect Sorting Intent (highest/lowest/least)
-# ------------------------------------------------------
-def detect_sort_intent(question: str):
-    q = question.lower()
-
-    DESC_WORDS = [
-        "highest", "top", "maximum", "max", "greatest", "largest",
-        "most", "bigger", "greater", "biggest", "strongest"
-    ]
-
-    ASC_WORDS = [
-        "lowest", "least", "minimum", "min", "smallest",
-        "bottom", "weaker", "less", "smaller", "lower", "lesser"
-    ]
-
-    for w in DESC_WORDS:
-        if w in q:
-            return "DESC"
-
-    for w in ASC_WORDS:
-        if w in q:
-            return "ASC"
-
-    return None
-
-
-# ------------------------------------------------------
-# Dimension Filters & Grouping Keywords
-# ------------------------------------------------------
-DIRECT_MAP = {
-    "customer": "CustomerName",
-    "branch": "BranchCode",
-    "company": "CompanyCode",
-    "department": "DeptCode",
-    "country": "CountryName",
-    "transport": "TransportMode",
-    "transport mode": "TransportMode",
-    "customer group": "CustomerGroupName",
-    "lead group": "CustomerLeadGroupName",
-    "product": "ProductLevel1",
-    "product level 1": "ProductLevel1",
-    "product level 2": "ProductLevel2",
-    "product level 3": "ProductLevel3"
-}
-
-
-def detect_dimension_filters(question: str):
-    q = question.lower()
-    filters = []
-
-    # Transport mode (AIR / SEA / COU / ROA / NOJ / FSA)
-    tmodes = ["air", "sea", "roa", "cou", "noj", "fsa"]
-    for mode in tmodes:
-        if f" {mode} " in q or q.endswith(mode):
-            filters.append({
-                "column": "TransportMode",
-                "operator": "=",
-                "value": mode.upper()
-            })
-
-    # Customer filter
-    m = re.search(r"customer\s+([a-z0-9 _-]+)", q)
-    if m:
-        filters.append({
-            "column": "CustomerName",
-            "operator": "=",
-            "value": m.group(1).strip().upper()
-        })
-
-    return filters
-
-
-def detect_group_column(question: str):
-    q = question.lower()
-    for key, col in DIRECT_MAP.items():
-        if key in q:
-            return col
-
-    # fallback
-    m = re.search(r"by\s+([a-z0-9 _-]+)", q)
-    if m:
-        phrase = m.group(1).replace(" ", "").lower()
-        for key, col in DIRECT_MAP.items():
-            if key.replace(" ", "") in phrase:
-                return col
-
-    return None
-
-
-# ------------------------------------------------------
-# Business Metric Detection
-# ------------------------------------------------------
-def detect_business_metric_key(question: str):
-    q = question.lower()
-    for key, meta in BUSINESS_METRICS.items():
-        for kw in meta["keywords"]:
-            if kw in q:
-                return key
-    return None
-
-
-def detect_metric_column(question: str):
-    q = question.lower()
-    nums = numeric_columns()
-
-    if "profit" in q:
-        return "JobProfit"
-    if "revenue" in q:
-        return "REVAmount"
-
-    return nums[0] if nums else None
+METRICS = load_metrics()
 
 
 # ------------------------------------------------------
@@ -283,98 +89,106 @@ def get_client():
 
 
 # ------------------------------------------------------
-# MAIN: Convert Question → Query Plan
+# Build AI Prompt
+# ------------------------------------------------------
+def build_prompt(question, schema, metadata, metrics):
+
+    return f"""
+You are an advanced SQL Semantic Reasoning Engine.
+Your job: Convert the user's question INTO A SQL QUERY PLAN IN JSON FORMAT.
+
+Your inputs:
+1. SQL schema of table {TABLE_NAME}
+2. Column descriptions from metadata.json
+3. Business metric formulas from metrics.json
+4. The natural language user question
+
+-----------------------------------
+USER QUESTION:
+{question}
+-----------------------------------
+
+SQL SCHEMA:
+{json.dumps(schema, indent=2)}
+
+COLUMN DESCRIPTIONS:
+{json.dumps(metadata, indent=2)}
+
+BUSINESS METRICS:
+{json.dumps(metrics, indent=2)}
+
+-----------------------------------
+RULES FOR QUERY PLAN GENERATION:
+-----------------------------------
+
+✔ Determine *what metric* user wants.
+✔ Infer metric using synonyms from metrics.json.
+✔ Convert expressions exactly as written in metrics.json.
+✔ Always reference columns using [ColumnName] format.
+
+✔ Detect:
+  • Filters (dimension, time, numeric ranges)
+  • Group By (categorical columns)
+  • Top N logic
+  • Sorting (highest, lowest, larger, greater, smaller, least, top)
+  • Trends (year-wise, month-wise)
+  • Periods (last year, last month, previous quarter)
+  • Comparisons (2023 vs 2024, revenue vs profit)
+  • Derived metrics like profit %, job count, delays, etc.
+
+✔ Use only REAL column names present in the schema.
+
+✔ JSON OUTPUT FORMAT (STRICT):
+{
+  "select": [
+    {
+      "column": "column_name_or_null",
+      "expression": "SQL expression or null",
+      "aggregation": "SUM|AVG|COUNT|etc",
+      "alias": "metric_name"
+    }
+  ],
+  "filters": [
+    {"column": "ColumnName", "operator": "=", "value": something}
+  ],
+  "group_by": ["ColumnName"],
+  "order_by": [
+    {"column": "AliasOrColumn", "direction": "ASC|DESC"}
+  ],
+  "limit": integer_or_null
+}
+
+Return ONLY JSON. NO text explanation.
+"""
+
+
+# ------------------------------------------------------
+# Extract Query via LLM
 # ------------------------------------------------------
 def extract_query(question: str):
     schema = get_schema()
-    nums = numeric_columns()
-    cats = categorical_columns()
+    client = get_client()
 
-    time_ctx = parse_time_from_text(question)
-    q_lower = question.lower()
+    if not client:
+        return {"error": "Missing GROQ_API_KEY"}
 
-    # BUSINESS METRIC PRIORITY
-    bm_key = detect_business_metric_key(question)
-    bm_meta = BUSINESS_METRICS.get(bm_key) if bm_key else None
+    prompt = build_prompt(question, schema, METADATA, METRICS)
 
-    agg = bm_meta["default_agg"] if bm_meta else "sum"
+    response = client.chat.completions.create(
+        model="llama3-70b-8192",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
+    )
 
-    # SELECT ENTRY
-    if bm_meta:
-        select_entry = {
-            "column": bm_meta["base_column"],
-            "expression": bm_meta["expression"],
-            "aggregation": agg,
-            "alias": bm_meta["alias"]
+    raw = response.choices[0].message["content"]
+
+    try:
+        plan = json.loads(raw)
+        return plan
+
+    except Exception as e:
+        # Return raw response so debugging is easy
+        return {
+            "error": f"Failed to parse LLM JSON: {e}",
+            "raw_response": raw
         }
-    else:
-        metric_col = detect_metric_column(question)
-        select_entry = {
-            "column": metric_col,
-            "expression": None,
-            "aggregation": agg,
-            "alias": metric_col
-        }
-
-    # GROUPING
-    group_col = detect_group_column(question)
-
-    # LIMIT
-    top_n = detect_top_n(question)
-
-    plan = {
-        "select": [select_entry],
-        "filters": [],
-        "group_by": [group_col] if group_col else [],
-        "order_by": [],
-        "limit": top_n
-    }
-
-    # TIME FILTERS
-    if time_ctx["year"]:
-        plan["filters"].append({
-            "column": "FinancialYear",
-            "operator": "=",
-            "value": time_ctx["year"]
-        })
-    if time_ctx["quarter"]:
-        plan["filters"].append({
-            "column": "FinancialQuarter",
-            "operator": "=",
-            "value": time_ctx["quarter"]
-        })
-    if time_ctx["month"]:
-        plan["filters"].append({
-            "column": "FinancialMonth",
-            "operator": "=",
-            "value": time_ctx["month"]
-        })
-
-    # DIMENSION FILTERS
-    dim_filters = detect_dimension_filters(question)
-    if dim_filters:
-        plan["filters"].extend(dim_filters)
-
-    # --------------------------------
-    # ORDER BY detection (ASC / DESC)
-    # --------------------------------
-    direction = None
-    q = question.lower()
-
-    # HIGH → DESC
-    if any(word in q for word in ["highest", "top", "most", "max", "maximum",
-                                  "larger", "greater", "biggest", "strongest"]):
-        direction = "DESC"
-
-    # LOW → ASC
-    elif any(word in q for word in ["least", "lowest", "lower", "lesser",
-                                    "min", "minimum", "smallest", "bottom",
-                                    "weaker"]):
-        direction = "ASC"
-
-    # Apply ORDER BY only if sorting intent exists
-    if direction:
-        alias = select_entry.get("alias", "value")
-        plan["order_by"] = [{"column": alias, "direction": direction}]
-
-    return plan

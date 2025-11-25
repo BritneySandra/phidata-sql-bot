@@ -1,0 +1,67 @@
+{
+  "revenue": {
+    "expression": "[REVAmount] + [WIPAmount]",
+    "aggregation": "SUM",
+    "synonyms": ["revenue", "sales", "turnover", "income", "rev"]
+  },
+
+  "cost": {
+    "expression": "[CSTAmount] + [ACRAmount]",
+    "aggregation": "SUM",
+    "synonyms": ["cost", "expenses", "total cost", "service cost"]
+  },
+
+  "profit": {
+    "expression": "[JobProfit]",
+    "aggregation": "SUM",
+    "synonyms": ["profit", "margin", "jobprofit", "earning"]
+  },
+
+  "profit_percentage": {
+    "expression": "CASE WHEN SUM([CSTAmount] + [ACRAmount]) = 0 THEN NULL ELSE (SUM([JobProfit]) / SUM([CSTAmount] + [ACRAmount])) * 100 END",
+    "aggregation": null,
+    "synonyms": ["profit percent", "profit %", "margin %", "profit ratio"]
+  },
+
+  "total_job_count": {
+    "expression": "COUNT(DISTINCT [JobNumber])",
+    "aggregation": null,
+    "synonyms": ["job count", "number of jobs", "total jobs", "count of jobs"]
+  },
+
+  "total_volume": {
+    "expression": "SUM([ActualVolume])",
+    "aggregation": null,
+    "synonyms": ["volume", "total volume", "sum volume"]
+  },
+
+  "usd_revenue": {
+    "expression": "[USDREVAmount]",
+    "aggregation": "SUM",
+    "synonyms": ["usd revenue", "revenue usd", "converted revenue", "rev usd"]
+  },
+
+  "trade_lane_continent": {
+    "expression": "[OriginContinent] + '-' + [DestinationContinent]",
+    "aggregation": null,
+    "synonyms": ["continent trade lane", "trade lane continent", "origin-destination continent"]
+  },
+
+  "trade_lane_country": {
+    "expression": "[OriginCountry] + '-' + [DestinationCountry]",
+    "aggregation": null,
+    "synonyms": ["country trade lane", "trade lane country", "origin-destination country"]
+  },
+
+  "arrival_delay_days": {
+    "expression": "DATEDIFF(DAY, [DestinationETA], [ConsolATA])",
+    "aggregation": "AVG",
+    "synonyms": ["arrival delay", "arrival delay days", "delay arrival"]
+  },
+
+  "departure_delay_days": {
+    "expression": "DATEDIFF(DAY, [OriginETD], [ConsolATD])",
+    "aggregation": "AVG",
+    "synonyms": ["departure delay", "departure delay days", "delay departure"]
+  }
+}
