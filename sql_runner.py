@@ -1,3 +1,4 @@
+# sql_runner.py - execute SQL and return rows
 import pyodbc
 import pandas as pd
 import os
@@ -6,6 +7,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def run_sql(sql, params=None):
+    """
+    Execute SQL safely and return rows as list of dicts.
+    Uses pandas.read_sql with params for parameterized query.
+    """
     conn = pyodbc.connect(
         f"DRIVER={{ODBC Driver 18 for SQL Server}};"
         f"SERVER={os.getenv('SQL_SERVER')};"
@@ -15,6 +20,13 @@ def run_sql(sql, params=None):
         f"Encrypt=no;TrustServerCertificate=yes;"
     )
 
-    df = pd.read_sql(sql, conn, params=params)
-    conn.close()
+    # pandas expects params sequence/tuple for pyodbc
+    try:
+        df = pd.read_sql(sql, conn, params=params)
+    finally:
+        conn.close()
+
+    # If DataFrame empty, return []
+    if df is None or df.empty:
+        return []
     return df.to_dict(orient="records")

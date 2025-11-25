@@ -1,4 +1,4 @@
-# main.py
+# main.py - FastAPI endpoints and UI
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,75 +21,31 @@ app.add_middleware(
 
 TABLE = "WBI_BI_Data_V2"
 
-
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "API running"}
-
 
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
 
-
-# -------------------------------
-# HTML Chat UI
-# -------------------------------
 @app.get("/chat", response_class=HTMLResponse)
 async def chat_ui():
     return """
 <!DOCTYPE html>
 <html>
-<head>
-<title>PhiData SQL Chatbot</title>
+<head><title>PhiData SQL Chatbot</title>
 <style>
-body {
-    background-color: #0d1117;
-    font-family: Arial, sans-serif;
-    color: #e6edf3;
-    margin: 0;
-    padding: 20px;
-}
+body { background-color: #0d1117; font-family: Arial, sans-serif; color: #e6edf3; margin: 0; padding: 20px; }
 #chat-container { max-width: 900px; margin: auto; }
 h2 { color: #58a6ff; margin-bottom: 20px; }
-#q {
-    width: 80%; padding: 12px;
-    border-radius: 6px;
-    border: 1px solid #30363d;
-    background: #161b22;
-    color: white;
-    outline: none;
-}
+#q { width: 80%; padding: 12px; border-radius: 6px; border: 1px solid #30363d; background: #161b22; color: white; outline: none; }
 #q::placeholder { color: #8b949e; }
-button {
-    padding: 12px 20px;
-    background: #238636;
-    border: none;
-    color: white;
-    border-radius: 6px;
-    cursor: pointer;
-}
+button { padding: 12px 20px; background: #238636; border: none; color: white; border-radius: 6px; cursor: pointer; }
 button:hover { background: #2ea043; }
-.chat-box {
-    background: #161b22;
-    border: 1px solid #30363d;
-    padding: 15px;
-    margin-top: 20px;
-    border-radius: 8px;
-    white-space: pre-wrap;
-    font-size: 14px;
-    overflow-x: auto;
-}
-.result-table {
-    width: 100%;
-    border-collapse: collapse;
-    margin-top: 10px;
-}
-.result-table th, .result-table td {
-    border: 1px solid #30363d;
-    padding: 8px;
-    background: #0d1117;
-}
+.chat-box { background: #161b22; border: 1px solid #30363d; padding: 15px; margin-top: 20px; border-radius: 8px; white-space: pre-wrap; font-size: 14px; overflow-x: auto; }
+.result-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+.result-table th, .result-table td { border: 1px solid #30363d; padding: 8px; background: #0d1117; }
 </style>
 </head>
 <body>
@@ -99,22 +55,18 @@ button:hover { background: #2ea043; }
     <button onclick="ask()">Send</button>
     <div id="a" class="chat-box"></div>
 </div>
-
 <script>
 async function ask() {
     let q = document.getElementById("q").value;
     if (!q) return;
     document.getElementById("a").innerHTML = "<i>Thinking...</i>";
-
     let res = await fetch('/ask', {
         method: 'POST',
         headers: {'Content-Type':'application/json'},
         body: JSON.stringify({question: q})
     });
     let data = await res.json();
-
     let html = "<b>SQL:</b><br>" + (data.sql || "(none)") + "<br><br>";
-
     if (data.rows && data.rows.length > 0 && data.columns) {
         html += "<b>Result:</b><br>";
         html += "<table class='result-table'><tr>";
@@ -126,11 +78,9 @@ async function ask() {
             html += "</tr>";
         });
         html += "</table>";
-        html += "<br><b>Summary:</b><br>" + (data.result || "");
     } else {
         html += "<b>Answer:</b><br>" + (data.result || "No data");
     }
-
     document.getElementById("a").innerHTML = html;
 }
 </script>
@@ -138,59 +88,50 @@ async function ask() {
 </html>
     """
 
-
 class Query(BaseModel):
     question: str
-
 
 @app.post("/ask")
 async def ask(q: Query):
     schema = get_schema()
-
     try:
-        # 1) LLM → Plan
         plan = extract_query(q.question)
 
-        if "error" in plan:
-            return {"sql": None, "result": "AI error: " + str(plan["error"]), "rows": [], "columns": []}
+        # If AI returned error, forward it
+        if isinstance(plan, dict) and plan.get("error"):
+            return {"sql": None, "result": f"AI returned incomplete plan: {plan.get('error')}", "rows": [], "columns": []}
 
-        # 2) Plan → SQL
         sql, params, columns = build_sql_from_plan(plan, TABLE, schema)
 
-        # 3) SQL → Data
         rows = run_sql(sql, params)
 
-        # 4) Natural language answer
         if not rows:
-            return {"sql": sql, "result": "No data found.", "rows": [], "columns": columns}
+            return {"sql": sql, "result": "No data found", "rows": [], "columns": columns}
 
-        # Natural language for 1 metric only
+        # If scalar single-row single-col, return human-friendly sentence
         if len(rows) == 1 and len(columns) == 1:
-            col = columns[0]
-            val = rows[0][col]
+            val = rows[0].get(columns[0])
             try:
-                val_fmt = f"{val:,}"
-            except:
+                # numeric formatting with commas (if numeric)
+                if isinstance(val, (int, float)):
+                    val_fmt = f"{val:,.2f}" if isinstance(val, float) else f"{val:,}"
+                else:
+                    val_fmt = str(val)
+            except Exception:
                 val_fmt = str(val)
-
-            friendly = col.replace("_", " ").replace("-", " ").capitalize()
-            summary = f"The {friendly} is {val_fmt}."
+            # produce a natural language response
+            summary = f"The {columns[0].replace('_',' ')} is {val_fmt}."
         else:
-            summary = f"I found {len(rows)} records for your query."
+            summary = f"{len(rows)} rows returned."
 
-        return {
-            "sql": sql,
-            "result": summary,
-            "rows": rows,
-            "columns": columns
-        }
+        return {"sql": sql, "result": summary, "rows": rows, "columns": columns}
 
     except Exception as e:
         return JSONResponse(
             status_code=200,
             content={
                 "sql": locals().get("sql", None),
-                "result": f"Error: {e}",
+                "result": f"SQL execution error: {e}",
                 "rows": [],
                 "columns": []
             }
