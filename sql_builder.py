@@ -1,4 +1,4 @@
-# sql_builder.py — safer, defensive SQL builder
+# sql_builder.py — defensive SQL builder (Option C-compatible)
 
 import re
 
@@ -9,11 +9,10 @@ def is_aggregate_expression(expr: str) -> bool:
         return False
     return AGG_RE.match(expr.strip()) is not None
 
-
 def build_sql_from_plan(plan, table, schema):
     """
-    Build SQL from normalized plan.
-    Returns (sql, params, columns) where params are in order for '?' placeholders.
+    Build SQL from normalized plan (output of agent.normalize_plan).
+    Returns tuple (sql, params, columns_list).
     """
     selects = plan.get("select", []) or []
     filters = plan.get("filters", []) or []
@@ -24,7 +23,7 @@ def build_sql_from_plan(plan, table, schema):
     sql_select_parts = []
     metric_alias = None
 
-    # include group_by columns first (ensure uniqueness & schema-valid)
+    # Validate and include group_by cols first
     seen_cols = set()
     valid_group_by = []
     for col in group_by:
@@ -32,56 +31,45 @@ def build_sql_from_plan(plan, table, schema):
             sql_select_parts.append(f"[{col}]")
             seen_cols.add(col)
             valid_group_by.append(col)
-    group_by = valid_group_by  # use validated group_by
+    group_by = valid_group_by
 
-    # add selects, preventing nested aggs and duplicates
+    # Build SELECT items
     for sel in selects:
         if not isinstance(sel, dict):
-            # skip malformed selects
             continue
-
         col = sel.get("column")
         expr = sel.get("expression")
         agg = sel.get("aggregation")
         alias = sel.get("alias") or (col if col else None)
 
-        # normalize aggregation (guard against strings like "None"/"null")
         if agg is not None and isinstance(agg, str) and agg.lower() in ("none", "null"):
             agg = None
 
-        # if alias missing, generate safe alias (avoid None)
         if not alias:
-            # create alias from column or expression
-            if col:
-                alias = col
-            else:
-                alias = "value"
+            alias = col if col else ("expr" if expr else "value")
 
-        # Only set metric_alias when we produce an aggregated metric column (not when we add simple group_by)
-        produced_expr = None
-        if expr and isinstance(expr, str) and expr.strip():
-            # If expression already contains an aggregate, don't wrap it
+        produced = None
+        # If expression exists:
+        if isinstance(expr, str) and expr.strip():
+            # If expr already contains aggregate -> use as-is
             if is_aggregate_expression(expr):
-                produced_expr = f"{expr} AS [{alias}]"
+                produced = f"{expr} AS [{alias}]"
             else:
                 if agg:
-                    produced_expr = f"{agg}({expr}) AS [{alias}]"
+                    produced = f"{agg}({expr}) AS [{alias}]"
                 else:
-                    produced_expr = f"{expr} AS [{alias}]"
-
+                    produced = f"{expr} AS [{alias}]"
         elif col:
             if col in seen_cols:
-                # skip duplicate column selection
                 continue
             if agg:
-                produced_expr = f"{agg}([{col}]) AS [{alias}]"
+                produced = f"{agg}([{col}]) AS [{alias}]"
             else:
-                produced_expr = f"[{col}] AS [{alias}]"
+                produced = f"[{col}] AS [{alias}]"
             seen_cols.add(col)
 
-        if produced_expr:
-            sql_select_parts.append(produced_expr)
-            # If this select is an aggregation, set metric_alias for ordering fallback
+        if produced:
+            sql_select_parts.append(produced)
             if agg:
                 metric_alias = alias
 
@@ -90,7 +78,7 @@ def build_sql_from_plan(plan, table, schema):
 
     sql = f"SELECT {', '.join(sql_select_parts)} FROM {table}"
 
-    # WHERE - build clauses only for columns existing in schema OR allow column aliases
+    # WHERE clause + params
     where_clauses = []
     params = []
     for flt in filters:
@@ -100,17 +88,14 @@ def build_sql_from_plan(plan, table, schema):
         op = flt.get("operator", "=") or "="
         val = flt.get("value")
 
-        # prefer to only param on known column names; but allow if alias used (we still parameterize)
         if not col:
             continue
 
-        # sanitize operator (simple allowlist)
         op = str(op).strip().upper()
         if op not in ("=", "<>", "!=", ">", "<", ">=", "<=", "IN", "LIKE"):
             op = "="
 
         if op == "IN" and isinstance(val, (list, tuple)):
-            # create placeholders for IN clause
             placeholders = ", ".join("?" for _ in val)
             where_clauses.append(f"[{col}] IN ({placeholders})")
             params.extend(val)
@@ -121,7 +106,7 @@ def build_sql_from_plan(plan, table, schema):
     if where_clauses:
         sql += " WHERE " + " AND ".join(where_clauses)
 
-    # GROUP BY - use validated group_by
+    # GROUP BY
     if group_by:
         sql += " GROUP BY " + ", ".join(f"[{c}]" for c in group_by)
 
@@ -138,27 +123,23 @@ def build_sql_from_plan(plan, table, schema):
             direction = str(direction).upper()
             if direction not in ("ASC", "DESC"):
                 direction = "DESC"
-            # allow ordering by alias or column (we don't require schema check here)
             order_parts.append(f"[{col}] {direction}")
 
     if order_parts:
         sql += " ORDER BY " + ", ".join(order_parts)
     elif limit and metric_alias:
-        # fallback ordering by metric alias if available
         sql += f" ORDER BY [{metric_alias}] DESC"
 
-    # LIMIT (TOP N) — apply TOP if limit present
+    # LIMIT (TOP N)
     if limit:
-        # guard limit type
         try:
             lim = int(limit)
             if lim > 0:
                 sql = f"SELECT TOP {lim} " + sql[7:]
         except Exception:
-            # ignore invalid limit
             pass
 
-    # output columns for UI (preserve order and dedupe)
+    # Columns for UI: group_by cols then aliases from selects (dedup)
     columns = []
     for c in group_by:
         columns.append(c)
