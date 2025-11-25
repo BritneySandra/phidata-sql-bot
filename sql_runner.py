@@ -1,6 +1,3 @@
-# ===========================
-# sql_runner.py (FINAL)
-# ===========================
 import pyodbc
 import pandas as pd
 import os
@@ -8,20 +5,21 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+
 def run_sql(sql, params=None):
-    try:
-        conn = pyodbc.connect(
-            f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-            f"SERVER={os.getenv('SQL_SERVER')};"
-            f"DATABASE={os.getenv('SQL_DATABASE')};"
-            f"UID={os.getenv('SQL_USERNAME')};"
-            f"PWD={os.getenv('SQL_PASSWORD')};"
-            f"Encrypt=no;TrustServerCertificate=yes;"
-        )
+    """Execute SQL safely and return rows as list of dicts."""
 
-        df = pd.read_sql(sql, conn, params=params)
-        conn.close()
-        return df.to_dict(orient="records")
+    conn = pyodbc.connect(
+        f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+        f"SERVER={os.getenv('SQL_SERVER')};"
+        f"DATABASE={os.getenv('SQL_DATABASE')};"
+        f"UID={os.getenv('SQL_USERNAME')};"
+        f"PWD={os.getenv('SQL_PASSWORD')};"
+        f"Encrypt=no;"
+        f"TrustServerCertificate=yes;"
+    )
 
-    except Exception as e:
-        raise Exception(f"SQL execution failed: {e}")
+    df = pd.read_sql(sql, conn, params=params)
+    conn.close()
+
+    return df.to_dict(orient="records")

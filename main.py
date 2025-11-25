@@ -1,6 +1,4 @@
-# ===========================
-# main.py (FINAL UPDATED)
-# ===========================
+# main.py
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,6 +10,7 @@ from sql_runner import run_sql
 
 app = FastAPI()
 
+# CORS for Power BI iframe
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,77 +23,157 @@ TABLE = "WBI_BI_Data_V2"
 
 @app.get("/")
 async def root():
-    return {"status": "ok"}
+    return {"status": "ok", "message": "API running"}
 
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
 
-# UI
+# -------------------------------
+# Dark-mode ChatGPT-style UI
+# -------------------------------
 @app.get("/chat", response_class=HTMLResponse)
 async def chat_ui():
     return """
-<html><body style="background:#0d1117;color:white;font-family:Arial;padding:20px;">
-<h2>PhiData SQL Chatbot</h2>
-<input id='q' style='width:80%;padding:10px;border-radius:5px;background:#161b22;color:white;'>
-<button onclick='ask()' style='padding:10px 20px;background:#238636;color:white;border:none;'>Send</button>
-<div id='a' style='white-space:pre-wrap;margin-top:20px;background:#161b22;padding:15px;'></div>
+<!DOCTYPE html>
+<html>
+<head>
+<title>PhiData SQL Chatbot</title>
+<style>
+body {
+    background-color: #0d1117;
+    font-family: Arial, sans-serif;
+    color: #e6edf3;
+    margin: 0;
+    padding: 20px;
+}
+#chat-container { max-width: 900px; margin: auto; }
+h2 { color: #58a6ff; margin-bottom: 20px; }
+#q {
+    width: 80%; padding: 12px;
+    border-radius: 6px;
+    border: 1px solid #30363d;
+    background: #161b22;
+    color: white;
+    outline: none;
+}
+#q::placeholder { color: #8b949e; }
+button {
+    padding: 12px 20px;
+    background: #238636;
+    border: none;
+    color: white;
+    border-radius: 6px;
+    cursor: pointer;
+}
+button:hover { background: #2ea043; }
+.chat-box {
+    background: #161b22;
+    border: 1px solid #30363d;
+    padding: 15px;
+    margin-top: 20px;
+    border-radius: 8px;
+    white-space: pre-wrap;
+    font-size: 14px;
+    overflow-x: auto;
+}
+.result-table {
+    width: 100%;
+    border-collapse: collapse;
+    margin-top: 10px;
+}
+.result-table th, .result-table td {
+    border: 1px solid #30363d;
+    padding: 8px;
+    background: #0d1117;
+}
+</style>
+</head>
+<body>
+<div id="chat-container">
+    <h2>PhiData SQL Chatbot</h2>
+    <input id="q" placeholder="Ask any question...">
+    <button onclick="ask()">Send</button>
+    <div id="a" class="chat-box"></div>
+</div>
 
 <script>
-async function ask(){
-    let q=document.getElementById("q").value;
-    document.getElementById("a").innerHTML="Thinking...";
+async function ask() {
+    let q = document.getElementById("q").value;
+    if (!q) return;
+    document.getElementById("a").innerHTML = "<i>Thinking...</i>";
 
-    let res=await fetch("/ask",{method:"POST",headers:{"Content-Type":"application/json"},
-    body:JSON.stringify({question:q})});
+    let res = await fetch('/ask', {
+        method: 'POST',
+        headers: {'Content-Type':'application/json'},
+        body: JSON.stringify({question: q})
+    });
+    let data = await res.json();
 
-    let data=await res.json();
+    let html = "<b>SQL:</b><br>" + (data.sql || "(none)") + "<br><br>";
 
-    let html="<b>SQL:</b><br>"+(data.sql||"(none)")+"<br><br>";
-
-    if(data.rows && data.rows.length){
-        html+="<b>Result:</b><br><table border='1' cellpadding='5'>";
-        html+="<tr>"+data.columns.map(c=>"<th>"+c+"</th>").join('')+"</tr>";
-        data.rows.forEach(r=>{
-            html+="<tr>"+data.columns.map(c=>"<td>"+(r[c]||'')+"</td>").join('')+"</tr>";
+    if (data.rows && data.rows.length > 0 && data.columns) {
+        html += "<b>Result:</b><br>";
+        html += "<table class='result-table'><tr>";
+        data.columns.forEach(c => html += "<th>" + c + "</th>");
+        html += "</tr>";
+        data.rows.forEach(r => {
+            html += "<tr>";
+            data.columns.forEach(c => html += "<td>" + (r[c] ?? '') + "</td>");
+            html += "</tr>";
         });
-        html+="</table>";
+        html += "</table>";
     } else {
-        html+="<b>Answer:</b><br>"+data.result;
+        html += "<b>Answer:</b><br>" + (data.result || "No data");
     }
-
-    document.getElementById("a").innerHTML=html;
+    document.getElementById("a").innerHTML = html;
 }
 </script>
-</body></html>
-"""
+</body>
+</html>
+    """
 
 class Query(BaseModel):
     question: str
 
 @app.post("/ask")
 async def ask(q: Query):
+    schema = get_schema()
+
     try:
+        # 1) question -> JSON plan
         plan = extract_query(q.question)
 
-        sql, params, columns = build_sql_from_plan(plan, TABLE, get_schema())
+        # 2) plan -> SQL + params
+        sql, params, columns = build_sql_from_plan(plan, TABLE, schema)
 
+        # 3) execute
         rows = run_sql(sql, params)
 
-        if len(rows)==1 and len(columns)==1:
+        if not rows:
+            return {"sql": sql, "result": "No data found", "rows": [], "columns": columns}
+
+        # Simple human text summary
+        if len(rows) == 1 and len(columns) == 1:
             val = rows[0][columns[0]]
-            try: val_fmt = f"{val:,}"
-            except: val_fmt = val
+            try:
+                val_fmt = f"{val:,}"
+            except Exception:
+                val_fmt = str(val)
             summary = f"{columns[0]} = {val_fmt}"
         else:
             summary = f"{len(rows)} rows returned."
 
-        return {"sql": sql, "rows": rows, "columns": columns, "result": summary}
+        return {"sql": sql, "result": summary, "rows": rows, "columns": columns}
 
     except Exception as e:
-        return JSONResponse(content={
-            "sql": None,
-            "rows": [],
-            "columns": [],
-            "result": f"Error: {e}"
-        })
+        # Catch any error (bad plan, SQL error, etc.)
+        return JSONResponse(
+            status_code=200,
+            content={
+                "sql": locals().get("sql", None),
+                "result": f"SQL execution error: {e}",
+                "rows": [],
+                "columns": []
+            }
+        )
