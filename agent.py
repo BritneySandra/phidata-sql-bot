@@ -1,10 +1,10 @@
-# agent.py — Fully Dynamic LLM SQL Agent
-# -----------------------------------------------------
-# This version removes all manual hardcoded logic.
-# The LLM uses schema + metadata.json + metrics.json
-# to dynamically infer filters, grouping, metrics,
-# top N, comparisons, trends, periods, etc.
-# -----------------------------------------------------
+# agent.py — Fully Dynamic LLM SQL Agent (Updated Version)
+# ---------------------------------------------------------
+# Fixes added:
+# 1. JSON-only extraction (ignores LLM explanations)
+# 2. Percent (%) sanitizer to avoid pyodbc "Invalid format specifier"
+# 3. Robust JSON parsing
+# ---------------------------------------------------------
 
 import os
 import json
@@ -53,7 +53,7 @@ def get_schema():
 
 
 # ------------------------------------------------------
-# Load metadata.json (column descriptions)
+# Load metadata.json
 # ------------------------------------------------------
 def load_metadata():
     try:
@@ -67,7 +67,7 @@ METADATA = load_metadata()
 
 
 # ------------------------------------------------------
-# Load metrics.json (business rules)
+# Load metrics.json
 # ------------------------------------------------------
 def load_metrics():
     try:
@@ -81,7 +81,7 @@ METRICS = load_metrics()
 
 
 # ------------------------------------------------------
-# LLM Client
+# LLM client
 # ------------------------------------------------------
 def get_client():
     api_key = os.getenv("GROQ_API_KEY")
@@ -89,26 +89,22 @@ def get_client():
 
 
 # ------------------------------------------------------
-# Build AI Prompt
+# Build prompt for LLM
 # ------------------------------------------------------
 def build_prompt(question, schema, metadata, metrics):
 
     return f"""
-You are an advanced SQL Semantic Reasoning Engine.
-Your job: Convert the user's question INTO A SQL QUERY PLAN IN JSON FORMAT.
+You are an expert SQL Semantic Engine.
 
-Your inputs:
-1. SQL schema of table {TABLE_NAME}
-2. Column descriptions from metadata.json
-3. Business metric formulas from metrics.json
-4. The natural language user question
+Convert the user question into a STRICT JSON query plan.
 
------------------------------------
 USER QUESTION:
 {question}
------------------------------------
 
-SQL SCHEMA:
+SQL TABLE:
+{TABLE_NAME}
+
+SCHEMA:
 {json.dumps(schema, indent=2)}
 
 COLUMN DESCRIPTIONS:
@@ -117,48 +113,33 @@ COLUMN DESCRIPTIONS:
 BUSINESS METRICS:
 {json.dumps(metrics, indent=2)}
 
------------------------------------
-RULES FOR QUERY PLAN GENERATION:
------------------------------------
-
-✔ Determine *what metric* user wants.
-✔ Infer metric using synonyms from metrics.json.
-✔ Convert expressions exactly as written in metrics.json.
-✔ Always reference columns using [ColumnName] format.
-
-✔ Detect:
-  • Filters (dimension, time, numeric ranges)
-  • Group By (categorical columns)
-  • Top N logic
-  • Sorting (highest, lowest, larger, greater, smaller, least, top)
-  • Trends (year-wise, month-wise)
-  • Periods (last year, last month, previous quarter)
-  • Comparisons (2023 vs 2024, revenue vs profit)
-  • Derived metrics like profit %, job count, delays, etc.
-
-✔ Use only REAL column names present in the schema.
-
-✔ JSON OUTPUT FORMAT (STRICT):
-{
+OUTPUT STRICT JSON ONLY. NO TEXT.
+FORMAT:
+{{
   "select": [
-    {
+    {{
       "column": "column_name_or_null",
-      "expression": "SQL expression or null",
+      "expression": "sql_expression_or_null",
       "aggregation": "SUM|AVG|COUNT|etc",
       "alias": "metric_name"
-    }
+    }}
   ],
   "filters": [
-    {"column": "ColumnName", "operator": "=", "value": something}
+    {{
+      "column": "ColumnName",
+      "operator": "=",
+      "value": any
+    }}
   ],
   "group_by": ["ColumnName"],
   "order_by": [
-    {"column": "AliasOrColumn", "direction": "ASC|DESC"}
+    {{
+      "column": "AliasOrColumn",
+      "direction": "ASC|DESC"
+    }}
   ],
-  "limit": integer_or_null
-}
-
-Return ONLY JSON. NO text explanation.
+  "limit": number_or_null
+}}
 """
 
 
@@ -172,6 +153,7 @@ def extract_query(question: str):
     if not client:
         return {"error": "Missing GROQ_API_KEY"}
 
+    # Send prompt
     prompt = build_prompt(question, schema, METADATA, METRICS)
 
     response = client.chat.completions.create(
@@ -180,15 +162,37 @@ def extract_query(question: str):
         temperature=0
     )
 
-    raw = response.choices[0].message["content"]
+    raw = response.choices[0].message["content"].strip()
 
+    # ----------------------------
+    # STEP 1: Only keep JSON {...}
+    # ----------------------------
+    json_start = raw.find("{")
+    json_end = raw.rfind("}")
+
+    if json_start == -1 or json_end == -1:
+        return {
+            "error": "LLM did not return JSON.",
+            "raw_response": raw
+        }
+
+    json_text = raw[json_start:json_end + 1]
+
+    # ----------------------------------------------------
+    # STEP 2: FIX — Remove '%' to avoid SQL format errors
+    # ----------------------------------------------------
+    json_text = json_text.replace("%", "_pct")
+
+    # ----------------------------------------------
+    # STEP 3: Attempt JSON parse
+    # ----------------------------------------------
     try:
-        plan = json.loads(raw)
+        plan = json.loads(json_text)
         return plan
 
     except Exception as e:
-        # Return raw response so debugging is easy
         return {
             "error": f"Failed to parse LLM JSON: {e}",
+            "json_received": json_text,
             "raw_response": raw
         }
