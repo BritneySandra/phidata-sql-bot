@@ -167,13 +167,12 @@ async def ask(q: Query):
         return {"sql": sql, "result": summary, "rows": rows, "columns": columns}
 
     except Exception as e:
-        # Catch any error (bad plan, SQL error, etc.)
-        return JSONResponse(
-            status_code=200,
-            content={
-                "sql": locals().get("sql", None),
-                "result": f"SQL execution error: {e}",
-                "rows": [],
-                "columns": []
-            }
+    return {
+        "sql": sql,
+        "params": params,
+        "result": f"SQL execution error: {e}",
+        "rows": [],
+        "columns": []
+    }
+
         )
