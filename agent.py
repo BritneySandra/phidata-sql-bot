@@ -1,12 +1,10 @@
-# agent.py — Fully Dynamic Auto-Model Groq SQL Agent
+# agent.py — Fully Dynamic Auto-Model Groq SQL Agent (FINAL VERSION)
 # --------------------------------------------------------------------
-# Features:
-# ✔ Auto-detect strongest available Groq model (70B > 32B > 8B)
-# ✔ No model decommission errors
-# ✔ JSON-only extraction
-# ✔ % sanitizer
-# ✔ Fully dynamic SQL intent extraction
-# ✔ Works with metadata.json + metrics.json
+# ✔ Auto-detect strongest Groq model
+# ✔ Fix for .message.content (new Groq API)
+# ✔ JSON-only extraction guard
+# ✔ % sanitizer for pyodbc safety
+# ✔ Fully dynamic metric + filter + grouping extraction
 # --------------------------------------------------------------------
 
 import os
@@ -89,13 +87,13 @@ METRICS = load_metrics()
 # ====================================================================
 def choose_best_groq_model(client):
     """
-    Auto-select the strongest available model from Groq.
-    Priority:
+    Auto-select strongest available model:
        1. llama-3.3-70b-versatile
        2. meta-llama/llama-4-scout-17b-16e-instruct
        3. qwen/qwen3-32b
        4. llama-3.1-8b-instant
     """
+
     preferred_order = [
         "llama-3.3-70b-versatile",
         "meta-llama/llama-4-scout-17b-16e-instruct",
@@ -112,13 +110,13 @@ def choose_best_groq_model(client):
                 print("🚀 Using Groq model:", m)
                 return m
 
-        # fallback to ANY LLM
+        # fallback to any LLaMA/Qwen model
         for m in available:
             if "llama" in m or "qwen" in m:
                 print("⚠️ Using fallback model:", m)
                 return m
 
-        # last fallback
+        # final fallback
         print("⚠️ Using final fallback model:", available[0])
         return available[0]
 
@@ -143,7 +141,7 @@ def build_prompt(question, schema, metadata, metrics):
     return f"""
 You are an expert SQL reasoning engine.
 
-Convert the user question into a STRICT JSON query plan only.
+Convert the user question into STRICT JSON only.
 
 USER QUESTION:
 {question}
@@ -160,7 +158,7 @@ COLUMN DESCRIPTIONS:
 BUSINESS METRICS:
 {json.dumps(metrics, indent=2)}
 
-Return STRICT JSON with this structure:
+Output STRICT JSON:
 {{
   "select": [
     {{
@@ -187,12 +185,12 @@ Return STRICT JSON with this structure:
   "limit": number_or_null
 }}
 
-NO extra text. NO explanations. JSON ONLY.
+NO extra explanation. JSON ONLY.
 """
 
 
 # ====================================================================
-#  MAIN FUNCTION — EXTRACT QUERY
+#  MAIN — EXTRACT QUERY USING LLM
 # ====================================================================
 def extract_query(question: str):
     schema = get_schema()
@@ -201,7 +199,7 @@ def extract_query(question: str):
     if not client:
         return {"error": "Missing GROQ_API_KEY"}
 
-    # Choose best available model
+    # Auto-select valid model
     model_name = choose_best_groq_model(client)
 
     prompt = build_prompt(question, schema, METADATA, METRICS)
@@ -212,10 +210,11 @@ def extract_query(question: str):
         temperature=0
     )
 
-   raw = response.choices[0].message.content.strip()
+    # NEW GROQ API — correct way to extract content
+    raw = response.choices[0].message.content.strip()
 
     # ---------------------------
-    # Extract only JSON {...}
+    # Extract pure JSON {...}
     # ---------------------------
     json_start = raw.find("{")
     json_end = raw.rfind("}")
@@ -229,12 +228,12 @@ def extract_query(question: str):
     json_text = raw[json_start:json_end + 1]
 
     # ---------------------------
-    # Sanitize % symbols
+    # Sanitize % to avoid pyodbc error
     # ---------------------------
     json_text = json_text.replace("%", "_pct")
 
     # ---------------------------
-    # Parse JSON
+    # Parse JSON safely
     # ---------------------------
     try:
         return json.loads(json_text)
