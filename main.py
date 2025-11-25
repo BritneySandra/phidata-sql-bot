@@ -1,4 +1,4 @@
-# main.py
+# main.py — FINAL STABLE VERSION
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -35,7 +35,7 @@ async def health():
 @app.get("/chat", response_class=HTMLResponse)
 async def chat_ui():
     return """
-<!DOCTYPE html>
+   <!DOCTYPE html>
 <html>
 <head>
 <title>PhiData SQL Chatbot</title>
@@ -133,47 +133,76 @@ async function ask() {
 </html>
     """
 
+
 class Query(BaseModel):
     question: str
+
 
 @app.post("/ask")
 async def ask(q: Query):
     schema = get_schema()
 
-    try:
-        # 1) question -> JSON plan
-        plan = extract_query(q.question)
+    # 1) Extract plan from LLM
+    plan = extract_query(q.question)
 
-        # 2) plan -> SQL + params
+    # ---- SAFETY FIXES ----
+    if not isinstance(plan, dict):
+        return {
+            "sql": None,
+            "result": f"Invalid response from AI model: {plan}",
+            "rows": [],
+            "columns": []
+        }
+
+    if "error" in plan:
+        return {
+            "sql": None,
+            "result": f"AI error: {plan['error']}",
+            "rows": [],
+            "columns": []
+        }
+
+    required_keys = ["select", "filters", "group_by", "order_by", "limit"]
+    if not all(k in plan for k in required_keys):
+        return {
+            "sql": None,
+            "result": f"AI returned incomplete plan: {plan}",
+            "rows": [],
+            "columns": []
+        }
+
+    try:
+        # 2) Build SQL
         sql, params, columns = build_sql_from_plan(plan, TABLE, schema)
 
-        # 3) execute
+        # 3) Execute SQL
         rows = run_sql(sql, params)
 
         if not rows:
-            return {"sql": sql, "result": "No data found", "rows": [], "columns": columns}
+            return {
+                "sql": sql,
+                "result": "No data found",
+                "rows": [],
+                "columns": columns
+            }
 
-        # Simple human text summary
+        # Human-friendly summary
         if len(rows) == 1 and len(columns) == 1:
-            val = rows[0][columns[0]]
+            value = rows[0][columns[0]]
             try:
-                val_fmt = f"{val:,}"
-            except Exception:
-                val_fmt = str(val)
-            summary = f"{columns[0]} = {val_fmt}"
+                value_fmt = f"{value:,}"
+            except:
+                value_fmt = value
+            summary = f"{columns[0]} = {value_fmt}"
         else:
             summary = f"{len(rows)} rows returned."
 
         return {"sql": sql, "result": summary, "rows": rows, "columns": columns}
 
     except Exception as e:
-        # Catch any error (bad plan, SQL error, etc.)
-        return JSONResponse(
-            status_code=200,
-            content={
-                "sql": locals().get("sql", None),
-                "result": f"SQL execution error: {e}",
-                "rows": [],
-                "columns": []
-            }
-        )
+        return {
+            "sql": None,
+            "result": f"SQL execution error: {e}",
+            "rows": [],
+            "columns": []
+        }

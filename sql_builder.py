@@ -2,84 +2,75 @@ import re
 
 AGG_RE = re.compile(r"^\s*(sum|avg|count|min|max)\s*\(", re.IGNORECASE)
 
-def is_aggregate_expression(expr: str) -> bool:
-    if not expr or not isinstance(expr, str):
-        return False
-    return AGG_RE.match(expr.strip()) is not None
+def is_aggregate_expression(expr):
+    return isinstance(expr, str) and AGG_RE.match(expr.strip())
 
 def build_sql_from_plan(plan, table, schema):
-    selects = plan.get("select", [])
-    filters = plan.get("filters", [])
-    group_by = plan.get("group_by", []) or []
-    order_by = plan.get("order_by", []) or []
-    limit = plan.get("limit")
+    if "error" in plan:
+        raise Exception(f"Invalid plan returned from LLM: {plan}")
 
-    sql_select_parts = []
+    selects = plan["select"]
+    filters = plan["filters"]
+    group_by = plan["group_by"]
+    order_by = plan["order_by"]
+    limit = plan["limit"]
+
+    sql_parts = []
     metric_alias = None
+    seen = set()
 
-    # include group_by columns first (ensure uniqueness & schema-valid)
-    seen_cols = set()
+    # Group by first
     for col in group_by:
-        if col in schema and col not in seen_cols:
-            sql_select_parts.append(f"[{col}]")
-            seen_cols.add(col)
+        if col in schema and col not in seen:
+            sql_parts.append(f"[{col}]")
+            seen.add(col)
 
-    # add selects, preventing nested aggs and duplicates
+    # SELECTS
     for sel in selects:
         col = sel.get("column")
         expr = sel.get("expression")
         agg = sel.get("aggregation")
-        alias = sel.get("alias") or (col if col else "value")
+        alias = sel.get("alias") or (col or "value")
 
-        # normalize aggregation
-        if agg is not None and (str(agg).lower() == "none" or str(agg).lower() == "null"):
+        if agg in ["none", "null", None]:
             agg = None
 
-        # track metric alias for ordering fallback
-        if agg:
-            metric_alias = alias
-
-        # if expression provided
-        if expr and isinstance(expr, str) and expr.strip():
-            if is_aggregate_expression(expr):
-                # expression already aggregate -> don't wrap
-                sql_select_parts.append(f"{expr} AS [{alias}]")
-            else:
-                if agg:
-                    sql_select_parts.append(f"{agg}({expr}) AS [{alias}]")
-                else:
-                    sql_select_parts.append(f"{expr} AS [{alias}]")
+        if expr and is_aggregate_expression(expr):
+            sql_parts.append(f"{expr} AS [{alias}]")
             continue
 
-        # if column provided
-        if col:
-            if col in seen_cols:
-                # skip duplicate column selection
-                continue
+        if expr:
             if agg:
-                sql_select_parts.append(f"{agg}([{col}]) AS [{alias}]")
+                sql_parts.append(f"{agg}({expr}) AS [{alias}]")
             else:
-                sql_select_parts.append(f"[{col}] AS [{alias}]")
-            seen_cols.add(col)
+                sql_parts.append(f"{expr} AS [{alias}]")
             continue
 
-    if not sql_select_parts:
-        raise Exception("No valid SELECT expressions in plan")
+        if col:
+            if col not in seen:
+                if agg:
+                    sql_parts.append(f"{agg}([{col}]) AS [{alias}]")
+                else:
+                    sql_parts.append(f"[{col}] AS [{alias}]")
+                seen.add(col)
+            continue
 
-    sql = f"SELECT {', '.join(sql_select_parts)} FROM {table}"
+    sql = f"SELECT {', '.join(sql_parts)} FROM {table}"
 
     # WHERE
-    where_clauses = []
+    where_parts = []
     params = []
     for flt in filters:
-        col = flt.get("column")
+        col = flt["column"]
         op = flt.get("operator", "=")
-        val = flt.get("value")
-        if col and col in schema:
-            where_clauses.append(f"[{col}] {op} ?")
+        val = flt["value"]
+
+        if col in schema:
+            where_parts.append(f"[{col}] {op} ?")
             params.append(val)
-    if where_clauses:
-        sql += " WHERE " + " AND ".join(where_clauses)
+
+    if where_parts:
+        sql += " WHERE " + " AND ".join(where_parts)
 
     # GROUP BY
     if group_by:
@@ -88,28 +79,26 @@ def build_sql_from_plan(plan, table, schema):
     # ORDER BY
     if order_by:
         sql += " ORDER BY " + ", ".join(
-            f"[{ob['column']}] {ob.get('direction','DESC')}" for ob in order_by
+            f"[{o['column']}] {o.get('direction','DESC')}" for o in order_by
         )
-    elif limit and metric_alias:
-        sql += f" ORDER BY [{metric_alias}] DESC"
 
-    # LIMIT (TOP N)
+    # LIMIT
     if limit:
-        sql = f"SELECT TOP {limit} " + sql[7:]
+        sql = "SELECT TOP " + str(limit) + " " + sql[7:]
 
-    # output columns for UI
+    # Build columns list
     columns = []
     for c in group_by:
         columns.append(c)
     for s in selects:
-        a = s.get("alias")
-        if a:
-            columns.append(a)
-    # dedupe preserve order
+        columns.append(s.get("alias"))
+
+    # unique
+    final_cols = []
     seen = set()
-    cols_ordered = []
     for c in columns:
-        if c not in seen:
+        if c and c not in seen:
             seen.add(c)
-            cols_ordered.append(c)
-    return sql, params, cols_ordered
+            final_cols.append(c)
+
+    return sql, params, final_cols
