@@ -1,125 +1,115 @@
 import re
 
-AGG_FUNCS = ("sum", "avg", "count", "min", "max")
+AGG_RE = re.compile(r"^\s*(sum|avg|count|min|max)\s*\(", re.IGNORECASE)
 
 def is_aggregate_expression(expr: str) -> bool:
-    """
-    Returns True if expr already starts with an aggregate function like:
-    SUM(...), AVG(...), COUNT(...), MIN(...), MAX(...)
-    """
-    if not expr:
+    if not expr or not isinstance(expr, str):
         return False
-    return re.match(r"^\s*(sum|avg|count|min|max)\s*\(", expr, re.IGNORECASE) is not None
-
+    return AGG_RE.match(expr.strip()) is not None
 
 def build_sql_from_plan(plan, table, schema):
     selects = plan.get("select", [])
     filters = plan.get("filters", [])
-    group_by = plan.get("group_by", [])
-    order_by = plan.get("order_by", [])
+    group_by = plan.get("group_by", []) or []
+    order_by = plan.get("order_by", []) or []
     limit = plan.get("limit")
 
     sql_select_parts = []
-
-    # ------------------------------------------------------
-    # 1. Include GROUP BY columns in SELECT (if not already)
-    # ------------------------------------------------------
-    for col in group_by:
-        if col in schema:
-            sql_select_parts.append(f"[{col}]")
-
-    # ------------------------------------------------------
-    # 2. Add metric columns or expressions
-    # ------------------------------------------------------
     metric_alias = None
 
+    # include group_by columns first (ensure uniqueness & schema-valid)
+    seen_cols = set()
+    for col in group_by:
+        if col in schema and col not in seen_cols:
+            sql_select_parts.append(f"[{col}]")
+            seen_cols.add(col)
+
+    # add selects, preventing nested aggs and duplicates
     for sel in selects:
         col = sel.get("column")
         expr = sel.get("expression")
-        agg = sel.get("aggregation")   # do NOT default to SUM blindly
-        alias = sel.get("alias", "value")
+        agg = sel.get("aggregation")
+        alias = sel.get("alias") or (col if col else "value")
 
-        # Track only real aggregated metric for fallback ORDER BY
-        if agg is not None and str(agg).lower() != "none":
+        # normalize aggregation
+        if agg is not None and (str(agg).lower() == "none" or str(agg).lower() == "null"):
+            agg = None
+
+        # track metric alias for ordering fallback
+        if agg:
             metric_alias = alias
 
-        # ---------- Case 1: Expression metric ----------
-        if expr:
-            expr_str = expr.strip()
-
-            # If aggregation is None OR expression already has an aggregate,
-            # just use the expression as-is.
-            if agg is None or str(agg).lower() == "none" or is_aggregate_expression(expr_str):
-                sql_select_parts.append(f"{expr_str} AS [{alias}]")
+        # if expression provided
+        if expr and isinstance(expr, str) and expr.strip():
+            if is_aggregate_expression(expr):
+                # expression already aggregate -> don't wrap
+                sql_select_parts.append(f"{expr} AS [{alias}]")
             else:
-                sql_select_parts.append(f"{agg}({expr_str}) AS [{alias}]")
+                if agg:
+                    sql_select_parts.append(f"{agg}({expr}) AS [{alias}]")
+                else:
+                    sql_select_parts.append(f"{expr} AS [{alias}]")
+            continue
 
-        # ---------- Case 2: Column metric ----------
-        elif col:
-            # No aggregation → plain column (dimension)
-            if agg is None or str(agg).lower() == "none":
-                sql_select_parts.append(f"[{col}] AS [{alias}]")
-            else:
+        # if column provided
+        if col:
+            if col in seen_cols:
+                # skip duplicate column selection
+                continue
+            if agg:
                 sql_select_parts.append(f"{agg}([{col}]) AS [{alias}]")
+            else:
+                sql_select_parts.append(f"[{col}] AS [{alias}]")
+            seen_cols.add(col)
+            continue
 
     if not sql_select_parts:
-        raise Exception("No valid select expressions in plan")
+        raise Exception("No valid SELECT expressions in plan")
 
     sql = f"SELECT {', '.join(sql_select_parts)} FROM {table}"
 
-    # ------------------------------------------------------
-    # 3. WHERE clause
-    # ------------------------------------------------------
+    # WHERE
     where_clauses = []
     params = []
-
     for flt in filters:
         col = flt.get("column")
         op = flt.get("operator", "=")
         val = flt.get("value")
-
         if col and col in schema:
             where_clauses.append(f"[{col}] {op} ?")
             params.append(val)
-
     if where_clauses:
         sql += " WHERE " + " AND ".join(where_clauses)
 
-    # ------------------------------------------------------
-    # 4. GROUP BY
-    # ------------------------------------------------------
+    # GROUP BY
     if group_by:
         sql += " GROUP BY " + ", ".join(f"[{c}]" for c in group_by)
 
-    # ------------------------------------------------------
-    # 5. ORDER BY
-    # ------------------------------------------------------
+    # ORDER BY
     if order_by:
         sql += " ORDER BY " + ", ".join(
-            f"[{ob['column']}] {ob.get('direction', 'DESC')}"
-            for ob in order_by
+            f"[{ob['column']}] {ob.get('direction','DESC')}" for ob in order_by
         )
     elif limit and metric_alias:
-        # If no ORDER BY but TOP N → order by metric desc by default
         sql += f" ORDER BY [{metric_alias}] DESC"
 
-    # ------------------------------------------------------
-    # 6. LIMIT (TOP N)
-    # ------------------------------------------------------
+    # LIMIT (TOP N)
     if limit:
         sql = f"SELECT TOP {limit} " + sql[7:]
 
-    # ------------------------------------------------------
-    # 7. Columns list (for UI)
-    # ------------------------------------------------------
+    # output columns for UI
     columns = []
-
-    for col in group_by:
-        columns.append(col)
-
-    for sel in selects:
-        alias = sel.get("alias")
-        if alias:
-            columns.append(alias)
-
-    return sql, params, columns
+    for c in group_by:
+        columns.append(c)
+    for s in selects:
+        a = s.get("alias")
+        if a:
+            columns.append(a)
+    # dedupe preserve order
+    seen = set()
+    cols_ordered = []
+    for c in columns:
+        if c not in seen:
+            seen.add(c)
+            cols_ordered.append(c)
+    return sql, params, cols_ordered
