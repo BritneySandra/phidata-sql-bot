@@ -1,4 +1,4 @@
-# agent.py — robust dynamic agent (Option C: accept both aggregation formats)
+# agent.py — FINAL dynamic agent with FY & time parsing + plan normalization (updated)
 import os
 import json
 import re
@@ -25,9 +25,8 @@ METADATA = load_json_file("metadata.json")
 METRICS = load_json_file("metrics.json")
 
 # -------------------------
-# SQL Schema loader
+# SQL Schema
 # -------------------------
-_SCHEMA = {}
 def load_sql_schema():
     try:
         import pyodbc
@@ -53,6 +52,7 @@ def load_sql_schema():
         print("⚠ Could not load schema:", e)
         return {}
 
+_SCHEMA = {}
 def get_schema():
     global _SCHEMA
     if not _SCHEMA:
@@ -60,7 +60,7 @@ def get_schema():
     return _SCHEMA
 
 # -------------------------
-# Groq client & model selection
+# GROQ client & auto-model
 # -------------------------
 def get_client():
     api_key = os.getenv("GROQ_API_KEY")
@@ -68,11 +68,10 @@ def get_client():
 
 def choose_best_groq_model(client):
     preferred_order = [
-        "qwen/qwen3-32b",
-        "meta-llama/llama-4-scout-17b-16e-instruct",
-        "allam-2-7b",
         "llama-3.3-70b-versatile",
-        "meta-llama/llama-4-maverick-17b-128e-instruct"
+        "meta-llama/llama-4-scout-17b-16e-instruct",
+        "qwen/qwen3-32b",
+        "llama-3.1-8b-instant"
     ]
     try:
         models = client.models.list()
@@ -81,20 +80,25 @@ def choose_best_groq_model(client):
             if m in available:
                 return m
         for m in available:
-            if ("qwen" in m.lower() or "llama" in m.lower() or "allam" in m.lower()) and "whisper" not in m.lower():
+            if "llama" in m or "qwen" in m:
                 return m
-        return available[0] if available else preferred_order[0]
+        return available[0] if available else "llama-3.1-8b-instant"
     except Exception:
-        return preferred_order[0]
+        return "llama-3.1-8b-instant"
 
 # -------------------------
-# Time utilities (FY starts in March)
+# Time utilities (FY starts in MARCH)
+# Financial year mapping:
+# FY X = Mar YEAR_X -> Feb YEAR_X+1
 # -------------------------
 def calendar_to_fy_year(year:int, month:int) -> int:
+    # If month >= 3 (Mar..Dec), FY = year (i.e., Mar 2024 -> FY2024)
+    # If month in Jan-Feb, FY = year -1 (Jan 2025 -> FY2024)
     return year if month >= 3 else year - 1
 
 def month_name_to_num(name: str):
     try:
+        # accept "Jan", "January", case-insensitive
         return datetime.strptime(name[:3].capitalize(), "%b").month
     except Exception:
         try:
@@ -102,26 +106,53 @@ def month_name_to_num(name: str):
         except Exception:
             return None
 
+def calendar_month_from_text(token: str):
+    token = token.strip().lower()
+    short = token[:3].capitalize()
+    try:
+        dt = datetime.strptime(short, "%b")
+        return dt.month
+    except:
+        return None
+
+def current_utc():
+    return datetime.utcnow()
+
+def last_n_months_period(n:int):
+    # returns list of (year, month) pairs for last n calendar months ending at now
+    now = current_utc()
+    months = []
+    y = now.year
+    m = now.month
+    for _ in range(n):
+        months.append((y,m))
+        m -= 1
+        if m == 0:
+            m = 12
+            y -= 1
+    return months[::-1]
+
+# Given a calendar date get FY month index (1..12) where 1=Mar, 2=Apr,...12=Feb
 def calendar_to_fy_month(calendar_month:int) -> int:
     return ((calendar_month - 3) % 12) + 1
 
 def fy_quarter_from_fy_month(fy_month:int) -> int:
     return ceil(fy_month / 3)
 
-def current_utc():
-    return datetime.utcnow()
-
+# Convert a "last quarter" phrase -> (FinancialYear, FinancialQuarter)
 def last_financial_quarter(reference=None):
     if not reference:
         reference = current_utc()
     fy_year = calendar_to_fy_year(reference.year, reference.month)
     fy_month = calendar_to_fy_month(reference.month)
     fq = fy_quarter_from_fy_month(fy_month)
+    # previous quarter
     if fq == 1:
         return fy_year - 1, 4
     else:
         return fy_year, fq - 1
 
+# previous calendar month
 def previous_calendar_month(reference=None):
     if not reference:
         reference = current_utc()
@@ -129,56 +160,80 @@ def previous_calendar_month(reference=None):
     prev = first - timedelta(days=1)
     return prev.year, prev.month
 
+# previous calendar year
 def previous_calendar_year(reference=None):
     if not reference:
         reference = current_utc()
     return reference.year - 1
 
 # -------------------------
-# sanitize helpers
+# Helper: sanitize filter value to be primitive (int/str)
 # -------------------------
 def sanitize_filter_value(val):
+    # If dict with common keys, extract sensible primitive
     if isinstance(val, dict):
+        # common possible forms: {"year":2024} or {"quarter":3} or {"month":5}
         for k in ("year","quarter","month","value"):
             if k in val:
                 return val[k]
+        # fallback: try to find an int in dict
         for v in val.values():
             if isinstance(v, int):
                 return v
+        # last resort: string convert
         return str(val)
-    if isinstance(val, (list, tuple)):
-        return list(val)
+    # If list, not directly supported—caller must handle
+    if isinstance(val, list):
+        return val
     return val
 
 # -------------------------
 # Time phrase parser
 # -------------------------
 def parse_time_filters(text: str):
+    """
+    Returns a list of filters like:
+    { "column": "FinancialYear", "operator": "=", "value": 2024 }
+    Uses FY by default for plain year (user specified FY default)
+    Handles:
+      - "last month", "previous month"
+      - "last quarter", "previous quarter"
+      - "last year", "previous year"
+      - explicit month names + year (e.g., January 2024)
+      - explicit quarters "Q1 2024" or "Quarter 1 2024"
+      - "FY 2024" or "financial year 2024"
+    """
     q = (text or "").lower()
     filters = []
 
+    # explicit FY mention: "FY 2024" or "financial year 2024"
     m = re.search(r'\b(?:fy|financial year)\s*[:#-]?\s*(20\d{2})\b', q)
     if m:
         fy = int(m.group(1))
+        # prefer FYYear column name if present (you mentioned FYYear exists)
         col = "FYYear" if "FYYear" in METADATA else ("FinancialYear" if "FinancialYear" in METADATA else "FinancialYear")
         filters.append({"column": col, "operator":"=", "value": fy})
         return filters
 
+    # explicit quarter with optional year: "Q1 2024" or "Quarter 2 2023"
     m = re.search(r'\b(?:q|quarter)\s*[-:\s]*([1-4])(?:[^0-9]+(20\d{2}))?', q)
     if m:
         qnum = int(m.group(1))
         year = int(m.group(2)) if m.group(2) else None
         if year:
+            # since default is FY interpretation, map the year directly to FinancialYear
             filters.append({"column":"FinancialQuarter","operator":"=","value": qnum})
             filters.append({"column":"FinancialYear","operator":"=","value": year})
         else:
             filters.append({"column":"FinancialQuarter","operator":"=","value": qnum})
         return filters
 
-    m = re.search(r'\b('
-                  r'january|february|march|april|may|june|july|august|september|october|november|december|'
-                  r'jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec'
-                  r')\s+(20\d{2})\b', q, flags=re.IGNORECASE)
+    # explicit month + year: e.g., January 2024 or Jan 2024
+    m = re.search(
+        r'\b('
+        r'january|february|march|april|may|june|july|august|september|october|november|december|'
+        r'jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec'
+        r')\s+(20\d{2})\b', q, flags=re.IGNORECASE)
     if m:
         mon = m.group(1)
         yr = int(m.group(2))
@@ -190,6 +245,7 @@ def parse_time_filters(text: str):
             filters.append({"column":"FinancialYear","operator":"=","value": fy_year})
             return filters
 
+    # last month / previous month
     if re.search(r'\blast month\b|\bprevious month\b', q):
         y, m = previous_calendar_month()
         fy = calendar_to_fy_year(y, m)
@@ -198,17 +254,22 @@ def parse_time_filters(text: str):
         filters.append({"column":"FinancialYear","operator":"=","value": fy})
         return filters
 
+    # last quarter / previous quarter (use FY logic)
     if re.search(r'\blast quarter\b|\bprevious quarter\b', q):
         fy, fq = last_financial_quarter()
         filters.append({"column":"FinancialQuarter","operator":"=","value": fq})
         filters.append({"column":"FinancialYear","operator":"=","value": fy})
         return filters
 
+    # last year / previous year
     if re.search(r'\blast year\b|\bprevious year\b', q):
+        # interpret as FinancialYear by default
         prev = previous_calendar_year()
         filters.append({"column":"FinancialYear","operator":"=","value": prev})
         return filters
 
+    # explicit calendar / transaction mention (if user says transaction year/month)
+    # Example: "transaction year 2024" -> use TransactionYear
     m = re.search(r'\btransaction year\s*(20\d{2})\b', q)
     if m:
         yr = int(m.group(1))
@@ -220,42 +281,18 @@ def parse_time_filters(text: str):
         filters.append({"column":"TransactionMonth","operator":"=","value": mon})
         return filters
 
+    # plain 4-digit year (no 'FY' word) -> per your preference treat as FinancialYear
     m = re.search(r'\b(20\d{2})\b', q)
     if m:
         yr = int(m.group(1))
         filters.append({"column":"FinancialYear","operator":"=","value": yr})
         return filters
 
+    # Nothing found
     return filters
 
 # -------------------------
-# JSON extraction helper
-# -------------------------
-def extract_first_json_object(text: str):
-    if not text or "{" not in text:
-        return None
-    start_positions = [m.start() for m in re.finditer(r'\{', text)]
-    for start in start_positions:
-        depth = 0
-        i = start
-        while i < len(text):
-            ch = text[i]
-            if ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    candidate = text[start:i+1]
-                    try:
-                        json.loads(candidate)
-                        return candidate
-                    except Exception:
-                        break
-            i += 1
-    return None
-
-# -------------------------
-# Plan normalization (accept both aggregation styles)
+# Plan normalization
 # -------------------------
 AGG_RE = re.compile(r"^\s*(sum|avg|count|min|max)\s*\(", re.IGNORECASE)
 def is_aggregate_expression(expr: str) -> bool:
@@ -264,128 +301,106 @@ def is_aggregate_expression(expr: str) -> bool:
     return AGG_RE.match(expr.strip()) is not None
 
 def normalize_plan(plan: dict):
-    # Ensure plan is object
-    if not isinstance(plan, dict):
-        return {"select": [], "filters": [], "group_by": [], "order_by": [], "limit": None}
-
-    plan = dict(plan)
+    """
+    Normalize LLM plan:
+     - Sanitize aliases (% -> _pct)
+     - Ensure group_by is a list of unique columns
+     - Ensure select contains group_by columns only once
+     - If a select.expression already contains an aggregate, set aggregation -> None
+     - Avoid nested aggregations: don't wrap expression if already aggregate
+     - Ensure only one instance of each dimension in SELECT
+    """
+    plan = dict(plan)  # shallow copy
     selects = plan.get("select", []) or []
     group_by = plan.get("group_by", []) or []
     order_by = plan.get("order_by", []) or []
-    filters = plan.get("filters", []) or []
 
-    # Normalize types
-    if not isinstance(selects, list):
-        # If model returned a single select as dict or string -> wrap
-        if isinstance(selects, dict):
-            selects = [selects]
-        else:
-            selects = []
-
-    if not isinstance(group_by, list):
-        group_by = [group_by] if group_by else []
-
-    if not isinstance(order_by, list):
-        order_by = [order_by] if order_by else []
-
-    if not isinstance(filters, list):
-        filters = [filters] if filters else []
-
-    schema = get_schema()
-    seen = set()
+    # sanitize aliases and expressions
+    seen_aliases = set()
     clean_selects = []
 
-    # Ensure group_by columns are valid and unique
-    clean_group_by = []
+    # first, ensure group_by unique & valid
+    gb = []
+    schema = get_schema()
     for g in group_by:
-        if isinstance(g, str) and g in schema and g not in clean_group_by:
-            clean_group_by.append(g)
+        if g and g not in gb and g in schema:
+            gb.append(g)
 
-    # Prepend missing group_by columns to select (so UI shows them)
-    for g in clean_group_by:
-        clean_selects.append({"column": g, "expression": None, "aggregation": None, "alias": g})
+    # ensure select includes group_by columns (if not present in LLM, add them)
+    gb_in_select_aliases = set()
+    for s in selects:
+        a = s.get("alias") or s.get("column")
+        if a:
+            gb_in_select_aliases.add(a)
+
+    for g in gb:
+        if g not in gb_in_select_aliases:
+            # insert at beginning
+            clean_selects.append({"column": g, "expression": None, "aggregation": None, "alias": g})
 
     for s in selects:
-        if not isinstance(s, dict):
-            continue
         col = s.get("column")
         expr = s.get("expression")
         agg = s.get("aggregation")
-        alias = s.get("alias") or (col if col else None)
-
-        # Accept both styles: if expression contains aggregate, leave it; if 'aggregation' exists use it.
-        if agg is not None and isinstance(agg, str) and agg.lower() in ("none", "null"):
-            agg = None
-
-        # if expression present and contains agg, don't double-wrap
+        alias = s.get("alias") or (col if col else "value")
+        # sanitize alias % char
+        alias = alias.replace("%", "_pct")
+        # if expression contains aggregate, don't aggregate it again
         if isinstance(expr, str) and is_aggregate_expression(expr):
             agg = None
-
-        if not alias:
-            alias = col if col else (expr if isinstance(expr, str) else "value")
-
-        # avoid duplicates
-        key = alias or col
-        if key in seen:
+        # normalize aggregation value for JSON null/None
+        if agg is not None and (str(agg).lower() == "none" or str(agg).lower() == "null"):
+            agg = None
+        # avoid duplicate dimension selects (if alias or column seen skip)
+        if alias in seen_aliases or (col and col in seen_aliases):
             continue
-        seen.add(key)
-
+        seen_aliases.add(alias)
+        if col:
+            seen_aliases.add(col)
         clean_selects.append({"column": col, "expression": expr, "aggregation": agg, "alias": alias})
 
-    # Normalize filters: ensure list of dicts with primitive values
-    clean_filters = []
-    for f in filters:
-        if isinstance(f, dict) and f.get("column"):
-            f["value"] = sanitize_filter_value(f.get("value"))
-            clean_filters.append(f)
-        elif isinstance(f, str) and "=" in f:
-            parts = f.split("=", 1)
-            clean_filters.append({"column": parts[0].strip(), "operator": "=", "value": parts[1].strip().strip("'\"")})
-        # ignore malformed
+    # dedupe clean_selects while preserving order
+    final_selects = []
+    seen = set()
+    for s in clean_selects:
+        key = s.get("alias") or s.get("column")
+        if key and key not in seen:
+            seen.add(key)
+            final_selects.append(s)
 
-    # normalize order_by entries
-    clean_order_by = []
+    # normalize order_by - ensure column exists in final_selects or group_by
+    valid_order_by = []
+    select_aliases = {s.get("alias") for s in final_selects if s.get("alias")}
     for ob in order_by:
-        if isinstance(ob, dict):
-            col = ob.get("column")
-            dirn = ob.get("direction", "DESC") or "DESC"
-            if col:
-                clean_order_by.append({"column": col, "direction": dirn.upper()})
-        elif isinstance(ob, str):
-            # allow "col desc"
-            m = re.match(r"^\s*([A-Za-z0-9_]+)\s*(asc|desc)?\s*$", ob, flags=re.IGNORECASE)
-            if m:
-                clean_order_by.append({"column": m.group(1), "direction": (m.group(2) or "DESC").upper()})
+        col = ob.get("column")
+        if col in select_aliases or col in gb:
+            valid_order_by.append(ob)
 
-    normalized = {
-        "select": clean_selects,
-        "filters": clean_filters,
-        "group_by": clean_group_by,
-        "order_by": clean_order_by,
-        "limit": plan.get("limit")
-    }
-    return normalized
+    # final assembly
+    plan["select"] = final_selects
+    plan["group_by"] = gb
+    plan["order_by"] = valid_order_by
+    plan["filters"] = plan.get("filters", []) or []
+    plan["limit"] = plan.get("limit")
+    return plan
 
 # -------------------------
-# Prompt builder (strict JSON)
+# LLM prompt builder (includes FY rules)
 # -------------------------
 def build_prompt(question, schema, metadata, metrics):
+    # Add explicit FY rules & parsing instruction
     rules = (
-        "- Financial Year: FY starts in March and ends in February next year.\n"
-        "- Plain year -> FinancialYear by default unless user mentions 'transaction'.\n"
-        "- Use FinancialMonth/FinancialQuarter when possible; TransactionYear/TransactionMonth only when explicitly asked.\n"
-        "- Detect last/previous/top N/compare/trend and produce filters/groupings accordingly.\n"
+        "- Financial Year rule: FY starts in March and ends in February next year.\n"
+        "- When user mentions 'FY' or 'financial year' or when a plain year appears, interpret as FinancialYear by default.\n"
+        "- FinancialMonth and FinancialQuarter columns exist; use them when producing time filters.\n"
+        "- TransactionYear/TransactionMonth are calendar-based (Jan-Dec) and should be used only if user explicitly says 'transaction year' or 'transaction month'.\n"
+        "- Detect 'last', 'previous', 'top N', 'compare', 'trend' and produce filters/groupings accordingly.\n"
     )
-    strict_json_instruction = (
-        "YOU MUST OUTPUT ONE VALID JSON OBJECT ONLY (no explanation, no markdown, no extra text).\n"
-        "If you cannot produce a plan, output exactly: {\"select\": [], \"filters\": [], \"group_by\": [], \"order_by\": [], \"limit\": null}\n"
-        "Types: select:list, filters:list, group_by:list, order_by:list, limit:null|int.\n"
-    )
+
     return f"""
-You are a SQL semantic engine. Convert the user's question into STRICT JSON query plan only.
+You are a SQL semantic engine. Convert the user's question into STRICT JSON query plan (no explanation).
 
 {rules}
-{strict_json_instruction}
 
 USER QUESTION:
 {question}
@@ -395,23 +410,20 @@ SCHEMA: {json.dumps(schema, indent=2)}
 COLUMN DESCRIPTIONS: {json.dumps(metadata, indent=2)}
 BUSINESS METRICS: {json.dumps(metrics, indent=2)}
 
-OUTPUT JSON keys:
+OUTPUT ONLY valid JSON with keys:
 select, filters, group_by, order_by, limit
 
-select items objects:
-- column (string|null)
-- expression (string|null)   # SQL expression, may already include aggregate, e.g. "SUM(JobProfit)"
-- aggregation (string|null)  # e.g., "sum","avg" - optional
-- alias (string)             # output column alias
+select items: column (or null), expression (or null), aggregation (or null), alias
 
-filters objects:
-{ "column": "<col>", "operator": "=", "value": <primitive> }
+Time guidance:
+- Use FinancialYear/FinancialMonth/FinancialQuarter when possible (FY starts March).
+- Use TransactionYear/TransactionMonth only if user explicitly asks for transaction/calendar month/year.
 
 Return JSON only.
 """
 
 # -------------------------
-# Main: extract_query(question) -> normalized plan
+# Extract and normalize plan
 # -------------------------
 def extract_query(question: str):
     client = get_client()
@@ -422,71 +434,41 @@ def extract_query(question: str):
     prompt = build_prompt(question, schema, METADATA, METRICS)
     model_name = choose_best_groq_model(client)
 
-    try:
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[{"role":"user","content":prompt}],
-            temperature=0
-        )
-    except Exception as e:
-        return {"error": f"LLM request failed: {e}"}
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role":"user","content":prompt}],
+        temperature=0
+    )
+    # new Groq API access
+    raw = response.choices[0].message.content.strip()
 
-    # read raw safely
-    raw = ""
-    try:
-        raw = response.choices[0].message.content.strip()
-    except Exception:
-        try:
-            raw = str(response.choices[0].text).strip()
-        except Exception:
-            raw = str(response)
-
-    # extract first valid JSON object
-    json_text = extract_first_json_object(raw)
-    if not json_text:
-        # fallback naive slice
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            candidate = raw[start:end+1]
-            try:
-                json.loads(candidate)
-                json_text = candidate
-            except Exception:
-                return {"error": "LLM did not return valid JSON", "raw": raw}
-
+    # get JSON block
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start == -1 or end == -1:
+        return {"error":"LLM did not return JSON", "raw": raw}
+    json_text = raw[start:end+1]
+    json_text = json_text.replace("%", "_pct")
     try:
         plan = json.loads(json_text)
     except Exception as e:
         return {"error": f"Failed to parse JSON: {e}", "json_received": json_text, "raw": raw}
 
-    if not isinstance(plan, dict):
-        return {"error": "LLM returned JSON but not an object", "raw": plan}
-
-    # Merge time filters parsed from text
+    # Add time filters parsed from text (ensuring primitive values)
     time_filters = parse_time_filters(question)
     plan_filters = plan.get("filters", []) or []
-    if not isinstance(plan_filters, list):
-        plan_filters = [plan_filters] if plan_filters else []
-
-    # sanitize existing filters then append time filters if missing
-    sanitized = []
-    for f in plan_filters:
-        if isinstance(f, dict) and f.get("column"):
-            f["value"] = sanitize_filter_value(f.get("value"))
-            sanitized.append(f)
-        elif isinstance(f, str) and "=" in f:
-            parts = f.split("=", 1)
-            sanitized.append({"column": parts[0].strip(), "operator": "=", "value": parts[1].strip().strip("'\"")})
-
+    # append only if not duplicate columns and sanitize values
     for tf in time_filters:
-        tf_val = sanitize_filter_value(tf.get("value"))
-        tf["value"] = tf_val
-        if not any(isinstance(f, dict) and f.get("column") == tf.get("column") for f in sanitized):
-            sanitized.append(tf)
+        # sanitize tf value
+        tf_value = sanitize_filter_value(tf.get("value"))
+        tf["value"] = tf_value
+        if not any(f.get("column")==tf.get("column") for f in plan_filters):
+            plan_filters.append(tf)
+    # sanitize any plan filters that may have dict-values
+    for f in plan_filters:
+        f["value"] = sanitize_filter_value(f.get("value"))
+    plan["filters"] = plan_filters
 
-    plan["filters"] = sanitized
-
-    # Normalize plan (dedupe selects, accept both agg styles)
+    # Normalize plan (dedupe selects, remove nested agg, ensure group_by included)
     plan = normalize_plan(plan)
     return plan

@@ -1,5 +1,3 @@
-# sql_builder.py — defensive SQL builder (Option C-compatible)
-
 import re
 
 AGG_RE = re.compile(r"^\s*(sum|avg|count|min|max)\s*\(", re.IGNORECASE)
@@ -10,12 +8,8 @@ def is_aggregate_expression(expr: str) -> bool:
     return AGG_RE.match(expr.strip()) is not None
 
 def build_sql_from_plan(plan, table, schema):
-    """
-    Build SQL from normalized plan (output of agent.normalize_plan).
-    Returns tuple (sql, params, columns_list).
-    """
-    selects = plan.get("select", []) or []
-    filters = plan.get("filters", []) or []
+    selects = plan.get("select", [])
+    filters = plan.get("filters", [])
     group_by = plan.get("group_by", []) or []
     order_by = plan.get("order_by", []) or []
     limit = plan.get("limit")
@@ -23,86 +17,67 @@ def build_sql_from_plan(plan, table, schema):
     sql_select_parts = []
     metric_alias = None
 
-    # Validate and include group_by cols first
+    # include group_by columns first (ensure uniqueness & schema-valid)
     seen_cols = set()
-    valid_group_by = []
     for col in group_by:
-        if isinstance(col, str) and col in schema and col not in seen_cols:
+        if col in schema and col not in seen_cols:
             sql_select_parts.append(f"[{col}]")
             seen_cols.add(col)
-            valid_group_by.append(col)
-    group_by = valid_group_by
 
-    # Build SELECT items
+    # add selects, preventing nested aggs and duplicates
     for sel in selects:
-        if not isinstance(sel, dict):
-            continue
         col = sel.get("column")
         expr = sel.get("expression")
         agg = sel.get("aggregation")
-        alias = sel.get("alias") or (col if col else None)
+        alias = sel.get("alias") or (col if col else "value")
 
-        if agg is not None and isinstance(agg, str) and agg.lower() in ("none", "null"):
+        # normalize aggregation
+        if agg is not None and (str(agg).lower() == "none" or str(agg).lower() == "null"):
             agg = None
 
-        if not alias:
-            alias = col if col else ("expr" if expr else "value")
+        # track metric alias for ordering fallback
+        if agg:
+            metric_alias = alias
 
-        produced = None
-        # If expression exists:
-        if isinstance(expr, str) and expr.strip():
-            # If expr already contains aggregate -> use as-is
+        # if expression provided
+        if expr and isinstance(expr, str) and expr.strip():
             if is_aggregate_expression(expr):
-                produced = f"{expr} AS [{alias}]"
+                # expression already aggregate -> don't wrap
+                sql_select_parts.append(f"{expr} AS [{alias}]")
             else:
                 if agg:
-                    produced = f"{agg}({expr}) AS [{alias}]"
+                    sql_select_parts.append(f"{agg}({expr}) AS [{alias}]")
                 else:
-                    produced = f"{expr} AS [{alias}]"
-        elif col:
+                    sql_select_parts.append(f"{expr} AS [{alias}]")
+            continue
+
+        # if column provided
+        if col:
             if col in seen_cols:
+                # skip duplicate column selection
                 continue
             if agg:
-                produced = f"{agg}([{col}]) AS [{alias}]"
+                sql_select_parts.append(f"{agg}([{col}]) AS [{alias}]")
             else:
-                produced = f"[{col}] AS [{alias}]"
+                sql_select_parts.append(f"[{col}] AS [{alias}]")
             seen_cols.add(col)
-
-        if produced:
-            sql_select_parts.append(produced)
-            if agg:
-                metric_alias = alias
+            continue
 
     if not sql_select_parts:
         raise Exception("No valid SELECT expressions in plan")
 
     sql = f"SELECT {', '.join(sql_select_parts)} FROM {table}"
 
-    # WHERE clause + params
+    # WHERE
     where_clauses = []
     params = []
     for flt in filters:
-        if not isinstance(flt, dict):
-            continue
         col = flt.get("column")
-        op = flt.get("operator", "=") or "="
+        op = flt.get("operator", "=")
         val = flt.get("value")
-
-        if not col:
-            continue
-
-        op = str(op).strip().upper()
-        if op not in ("=", "<>", "!=", ">", "<", ">=", "<=", "IN", "LIKE"):
-            op = "="
-
-        if op == "IN" and isinstance(val, (list, tuple)):
-            placeholders = ", ".join("?" for _ in val)
-            where_clauses.append(f"[{col}] IN ({placeholders})")
-            params.extend(val)
-        else:
+        if col and col in schema:
             where_clauses.append(f"[{col}] {op} ?")
             params.append(val)
-
     if where_clauses:
         sql += " WHERE " + " AND ".join(where_clauses)
 
@@ -111,48 +86,30 @@ def build_sql_from_plan(plan, table, schema):
         sql += " GROUP BY " + ", ".join(f"[{c}]" for c in group_by)
 
     # ORDER BY
-    order_parts = []
-    if isinstance(order_by, list):
-        for ob in order_by:
-            if not isinstance(ob, dict):
-                continue
-            col = ob.get("column")
-            direction = ob.get("direction", "DESC") or "DESC"
-            if not col:
-                continue
-            direction = str(direction).upper()
-            if direction not in ("ASC", "DESC"):
-                direction = "DESC"
-            order_parts.append(f"[{col}] {direction}")
-
-    if order_parts:
-        sql += " ORDER BY " + ", ".join(order_parts)
+    if order_by:
+        sql += " ORDER BY " + ", ".join(
+            f"[{ob['column']}] {ob.get('direction','DESC')}" for ob in order_by
+        )
     elif limit and metric_alias:
         sql += f" ORDER BY [{metric_alias}] DESC"
 
     # LIMIT (TOP N)
     if limit:
-        try:
-            lim = int(limit)
-            if lim > 0:
-                sql = f"SELECT TOP {lim} " + sql[7:]
-        except Exception:
-            pass
+        sql = f"SELECT TOP {limit} " + sql[7:]
 
-    # Columns for UI: group_by cols then aliases from selects (dedup)
+    # output columns for UI
     columns = []
     for c in group_by:
         columns.append(c)
     for s in selects:
-        if isinstance(s, dict):
-            a = s.get("alias")
-            if a:
-                columns.append(a)
+        a = s.get("alias")
+        if a:
+            columns.append(a)
+    # dedupe preserve order
     seen = set()
     cols_ordered = []
     for c in columns:
         if c not in seen:
             seen.add(c)
             cols_ordered.append(c)
-
     return sql, params, cols_ordered
