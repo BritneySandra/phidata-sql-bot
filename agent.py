@@ -212,7 +212,7 @@ def extract_query(question: str):
         temperature=0
     )
 
-    raw = response.choices[0].message["content"].strip()
+   raw = response.choices[0].message.content.strip()
 
     # ---------------------------
     # Extract only JSON {...}
