@@ -1,4 +1,7 @@
-# agent.py — Stable JSON-safe version for Groq + Qwen models
+# ---------------------------
+# agent.py (FINAL – QWEN FIX)
+# ---------------------------
+
 import os
 import json
 import re
@@ -12,20 +15,21 @@ load_dotenv()
 TABLE_NAME = "WBI_BI_Data_V2"
 
 # -------------------------
-# Load helpers & config
+# Load metadata
 # -------------------------
 def load_json_file(path):
     try:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except:
         return {}
 
 METADATA = load_json_file("metadata.json")
 METRICS = load_json_file("metrics.json")
 
+
 # -------------------------
-# SQL Schema
+# Load SQL Schema
 # -------------------------
 def load_sql_schema():
     try:
@@ -37,7 +41,7 @@ def load_sql_schema():
             f"UID={os.getenv('SQL_USERNAME')};"
             f"PWD={os.getenv('SQL_PASSWORD')};"
             f"Encrypt=no;TrustServerCertificate=yes;",
-            timeout=5
+            timeout=5,
         )
         cursor = conn.cursor()
         cursor.execute(f"""
@@ -59,40 +63,29 @@ def get_schema():
         _SCHEMA = load_sql_schema()
     return _SCHEMA
 
+
 # -------------------------
-# GROQ client & auto-model
+# Groq client
 # -------------------------
 def get_client():
-    api_key = os.getenv("GROQ_API_KEY")
-    return Groq(api_key=api_key) if api_key else None
+    key = os.getenv("GROQ_API_KEY")
+    return Groq(api_key=key) if key else None
 
+
+# FORCE qwen/qwen3-32b (stable & available)
 def choose_best_groq_model(client):
-    preferred = [
-        "qwen/qwen3-32b",  
-        "meta-llama/llama-4-scout-17b-16e-instruct",
-        "llama-3.1-8b-instant",
-    ]
-    try:
-        models = [m.id for m in client.models.list().data]
-        for m in preferred:
-            if m in models:
-                return m
-        for m in models:
-            if "qwen" in m or "llama" in m:
-                return m
-        return models[0] if models else "llama-3.1-8b-instant"
-    except:
-        return "qwen/qwen3-32b"
+    return "qwen/qwen3-32b"
+
 
 # -------------------------
-# Time utilities (FY logic)
+# Time utility functions
 # -------------------------
 def calendar_to_fy_year(year, month):
     return year if month >= 3 else year - 1
 
 def month_name_to_num(name):
     try:
-        return datetime.strptime(name[:3].capitalize(), "%b").month
+        return datetime.strptime(name[:3], "%b").month
     except:
         try:
             return datetime.strptime(name, "%B").month
@@ -102,132 +95,72 @@ def month_name_to_num(name):
 def calendar_to_fy_month(calendar_month):
     return ((calendar_month - 3) % 12) + 1
 
-def fy_quarter_from_fy_month(fm):
-    return ceil(fm / 3)
-
-def last_financial_quarter(reference=None):
-    if not reference:
-        reference = datetime.utcnow()
-    fy_year = calendar_to_fy_year(reference.year, reference.month)
-    fy_month = calendar_to_fy_month(reference.month)
-    fq = fy_quarter_from_fy_month(fy_month)
-    if fq == 1:
-        return fy_year - 1, 4
-    return fy_year, fq - 1
-
-def previous_calendar_month(reference=None):
-    if not reference:
-        reference = datetime.utcnow()
-    first = reference.replace(day=1)
-    prev = first - timedelta(days=1)
-    return prev.year, prev.month
-
-def previous_calendar_year(reference=None):
-    if not reference:
-        reference = datetime.utcnow()
-    return reference.year - 1
 
 # -------------------------
-# Filter sanitization
-# -------------------------
-def sanitize_filter_value(val):
-    if isinstance(val, dict):
-        for k in ("year","quarter","month","value"):
-            if k in val: return val[k]
-        for v in val.values():
-            if isinstance(v, int): return v
-        return str(val)
-    return val
-
-# -------------------------
-# Time parsing
+# Time Filter Parser
 # -------------------------
 def parse_time_filters(text):
-    q = (text or "").lower()
+    q = text.lower()
     filters = []
 
-    m = re.search(r'\b(?:fy|financial year)\s*(20\d{2})\b', q)
+    # FY 2024
+    m = re.search(r"(?:fy|financial year)\s*(20\d{2})", q)
     if m:
-        fy = int(m.group(1))
-        filters.append({"column":"FinancialYear","operator":"=","value":fy})
+        filters.append({"column": "FinancialYear", "operator": "=", "value": int(m.group(1))})
         return filters
 
-    m = re.search(r'\b(?:q|quarter)\s*([1-4])(?:[^0-9]+(20\d{2}))?', q)
+    # Jan 2024
+    m = re.search(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(20\d{2})", q)
     if m:
-        qnum = int(m.group(1))
-        year = m.group(2)
-        filters.append({"column":"FinancialQuarter","operator":"=","value":qnum})
-        if year:
-            filters.append({"column":"FinancialYear","operator":"=","value":int(year)})
-        return filters
-
-    m = re.search(r'\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|'
-                  r'january|february|march|april|may|june|july|august|september|october|november|december)'
-                  r'\s+(20\d{2})', q)
-    if m:
-        mon = m.group(1)
+        mon = month_name_to_num(m.group(1))
         yr = int(m.group(2))
-        cal_month = month_name_to_num(mon)
-        if cal_month:
-            filters.append({"column":"FinancialMonth","operator":"=","value":calendar_to_fy_month(cal_month)})
-            filters.append({"column":"FinancialYear","operator":"=","value":calendar_to_fy_year(yr, cal_month)})
-            return filters
-
-    if "last month" in q or "previous month" in q:
-        y, m = previous_calendar_month()
-        filters.append({"column":"FinancialMonth","operator":"=","value":calendar_to_fy_month(m)})
-        filters.append({"column":"FinancialYear","operator":"=","value":calendar_to_fy_year(y, m)})
+        filters.append({"column": "FinancialMonth", "operator": "=", "value": calendar_to_fy_month(mon)})
+        filters.append({"column": "FinancialYear", "operator": "=", "value": calendar_to_fy_year(yr, mon)})
         return filters
 
-    if "last quarter" in q or "previous quarter" in q:
-        fy, fq = last_financial_quarter()
-        filters.append({"column":"FinancialQuarter","operator":"=","value":fq})
-        filters.append({"column":"FinancialYear","operator":"=","value":fy})
-        return filters
-
-    m = re.search(r'\b(20\d{2})\b', q)
+    # plain year 2024
+    m = re.search(r"\b(20\d{2})\b", q)
     if m:
-        filters.append({"column":"FinancialYear","operator":"=","value":int(m.group(1))})
+        filters.append({"column": "FinancialYear", "operator": "=", "value": int(m.group(1))})
         return filters
 
     return filters
 
+
 # -------------------------
-# Plan normalization
+# Plan Normalization Helpers
 # -------------------------
 AGG_RE = re.compile(r"^\s*(sum|avg|count|min|max)\s*\(", re.IGNORECASE)
 
 def is_aggregate_expression(expr):
-    return isinstance(expr, str) and AGG_RE.match(expr.strip())
+    if not isinstance(expr, str):
+        return False
+    return AGG_RE.match(expr.strip()) is not None
+
 
 def normalize_plan(plan):
-    plan = dict(plan)
+    if not isinstance(plan, dict):
+        return {"select": [], "filters": [], "group_by": [], "order_by": []}
+
     selects = plan.get("select", []) or []
+    filters = plan.get("filters", []) or []
     group_by = plan.get("group_by", []) or []
-    order_by = plan.get("order_by", []) or []
 
-    seen_alias = set()
     clean_selects = []
+    used = set()
 
-    schema = get_schema()
-    group_clean = [g for g in group_by if g in schema]
-
-    for g in group_clean:
-        clean_selects.append({"column": g, "expression": None, "aggregation": None, "alias": g})
-        seen_alias.add(g)
-
+    # Prevent duplicates & nested aggs
     for s in selects:
         col = s.get("column")
         expr = s.get("expression")
         agg = s.get("aggregation")
         alias = (s.get("alias") or col or "value").replace("%", "_pct")
 
-        if alias in seen_alias:
+        if alias in used:
             continue
+        used.add(alias)
 
         if expr and is_aggregate_expression(expr):
-            agg = None
-        if agg in ("null","none","NULL","None"):
             agg = None
 
         clean_selects.append({
@@ -236,40 +169,46 @@ def normalize_plan(plan):
             "aggregation": agg,
             "alias": alias
         })
-        seen_alias.add(alias)
 
     plan["select"] = clean_selects
-    plan["group_by"] = group_clean
-    plan["order_by"] = order_by
+    plan["filters"] = filters
+    plan["group_by"] = group_by
     return plan
 
+
 # -------------------------
-# LLM prompt builder
+# Prompt Builder
 # -------------------------
 def build_prompt(question, schema, metadata, metrics):
+
     return f"""
-You MUST return ONLY JSON. No explanation. No markdown.
+Return ONLY a VALID JSON object. NO text, NO markdown, NO commentary.
 
 USER QUESTION:
 {question}
 
 TABLE: {TABLE_NAME}
+SCHEMA: {json.dumps(schema)}
+METADATA: {json.dumps(metadata)}
+METRICS: {json.dumps(metrics)}
 
-SCHEMA:
-{json.dumps(schema, indent=2)}
+Format exactly like this:
 
-COLUMN DESCRIPTIONS:
-{json.dumps(metadata, indent=2)}
+{{
+  "select": [
+      {{"column": "REVAmount", "expression": null, "aggregation": "SUM", "alias": "total_revenue"}}
+  ],
+  "filters": [],
+  "group_by": [],
+  "order_by": []
+}}
 
-BUSINESS METRICS:
-{json.dumps(metrics, indent=2)}
-
-OUTPUT JSON KEYS:
-select, filters, group_by, order_by, limit
+Return ONLY JSON.
 """
 
+
 # -------------------------
-# FIXED SAFE extract_query()
+# STRICT JSON Extractor
 # -------------------------
 def extract_query(question: str):
     client = get_client()
@@ -277,71 +216,37 @@ def extract_query(question: str):
         return {"error": "Missing GROQ_API_KEY"}
 
     schema = get_schema()
+    model = choose_best_groq_model(client)
     prompt = build_prompt(question, schema, METADATA, METRICS)
-    model_name = choose_best_groq_model(client)
 
-    forced_prompt = (
-        "Return ONLY valid JSON. No text outside JSON.\n"
-        "If cannot answer, return {}.\n\n"
-        + prompt
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0
     )
 
-    try:
-        response = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": "Output must be VALID JSON only."},
-                {"role": "user", "content": forced_prompt}
-            ],
-            temperature=0
-        )
-        raw = response.choices[0].message.content.strip()
+    raw = resp.choices[0].message.content.strip()
 
-    except Exception as e:
-        return {"error": f"Groq API error: {e}"}
+    # extract pure JSON (handles markdown, text, explanations)
+    json_blocks = re.findall(r"{(?:[^{}]|(?:\{[^{}]*\}))*}", raw, re.DOTALL)
 
-    # Try extracting JSON
-    try:
-        start = raw.find("{")
-        end = raw.rfind("}")
-        if start == -1 or end == -1:
-            raise ValueError("No JSON found")
+    if not json_blocks:
+        return {"error": "json_parse_failed", "raw": raw}
 
-        json_text = raw[start:end+1].replace("%", "_pct")
-        plan = json.loads(json_text)
-
-    except Exception:
-        # JSON Repair
+    plan = None
+    for blk in json_blocks:
         try:
-            fix_prompt = f"""
-Fix the following into VALID JSON only.
---- START ---
-{raw}
---- END ---
-"""
-            repair = client.chat.completions.create(
-                model="qwen/qwen3-32b",
-                messages=[
-                    {"role": "system", "content": "Fix malformed JSON. Output ONLY JSON."},
-                    {"role": "user", "content": fix_prompt}
-                ],
-                temperature=0
-            )
-            fixed = repair.choices[0].message.content.strip()
-            fixed_json = fixed[fixed.find("{"):fixed.rfind("}")+1]
-            plan = json.loads(fixed_json)
+            plan = json.loads(blk)
+            break
+        except:
+            continue
 
-        except Exception as e2:
-            return {"error": "json_parse_failed", "raw": raw, "repair_error": str(e2)}
+    if not isinstance(plan, dict):
+        return {"error": "json_parse_failed", "raw": raw}
 
-    # Time filters
+    # append time filters
     time_filters = parse_time_filters(question)
-    plan_filters = plan.get("filters", []) or []
-    for tf in time_filters:
-        tf["value"] = sanitize_filter_value(tf["value"])
-        if not any(f.get("column") == tf["column"] for f in plan_filters):
-            plan_filters.append(tf)
-    plan["filters"] = plan_filters
+    existing = plan.get("filters", [])
+    plan["filters"] = existing + time_filters
 
-    # Normalize
     return normalize_plan(plan)
