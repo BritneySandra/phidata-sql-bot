@@ -1,4 +1,4 @@
-# agent.py — FINAL dynamic agent with FY & time parsing + plan normalization
+# agent.py — FINAL dynamic agent with FY & time parsing + plan normalization (updated)
 import os
 import json
 import re
@@ -98,12 +98,11 @@ def calendar_to_fy_year(year:int, month:int) -> int:
 
 def month_name_to_num(name: str):
     try:
-        datetime_obj = datetime.strptime(name[:3], "%b")
-        return datetime_obj.month
+        # accept "Jan", "January", case-insensitive
+        return datetime.strptime(name[:3].capitalize(), "%b").month
     except Exception:
         try:
-            datetime_obj = datetime.strptime(name, "%B")
-            return datetime_obj.month
+            return datetime.strptime(name, "%B").month
         except Exception:
             return None
 
@@ -168,6 +167,27 @@ def previous_calendar_year(reference=None):
     return reference.year - 1
 
 # -------------------------
+# Helper: sanitize filter value to be primitive (int/str)
+# -------------------------
+def sanitize_filter_value(val):
+    # If dict with common keys, extract sensible primitive
+    if isinstance(val, dict):
+        # common possible forms: {"year":2024} or {"quarter":3} or {"month":5}
+        for k in ("year","quarter","month","value"):
+            if k in val:
+                return val[k]
+        # fallback: try to find an int in dict
+        for v in val.values():
+            if isinstance(v, int):
+                return v
+        # last resort: string convert
+        return str(val)
+    # If list, not directly supported—caller must handle
+    if isinstance(val, list):
+        return val
+    return val
+
+# -------------------------
 # Time phrase parser
 # -------------------------
 def parse_time_filters(text: str):
@@ -183,87 +203,92 @@ def parse_time_filters(text: str):
       - explicit quarters "Q1 2024" or "Quarter 1 2024"
       - "FY 2024" or "financial year 2024"
     """
-    q = text.lower()
+    q = (text or "").lower()
     filters = []
 
-    # explicit FY mention
-    m = re.search(r'\b(fy|financial year)\s*[:#-]?\s*(20\d{2})\b', q)
+    # explicit FY mention: "FY 2024" or "financial year 2024"
+    m = re.search(r'\b(?:fy|financial year)\s*[:#-]?\s*(20\d{2})\b', q)
     if m:
-        fy = int(m.group(2))
-        filters.append({"column": "FYYear" if "FYYear" in METADATA else "FinancialYear", "operator":"=", "value": fy})
+        fy = int(m.group(1))
+        # prefer FYYear column name if present (you mentioned FYYear exists)
+        col = "FYYear" if "FYYear" in METADATA else ("FinancialYear" if "FinancialYear" in METADATA else "FinancialYear")
+        filters.append({"column": col, "operator":"=", "value": fy})
         return filters
 
-    # explicit quarter with FY or calendar
-    m = re.search(r'\b(?:q|quarter)\s*[-:]*\s*([1-4])(?:[^0-9]+(20\d{2}))?', q)
+    # explicit quarter with optional year: "Q1 2024" or "Quarter 2 2023"
+    m = re.search(r'\b(?:q|quarter)\s*[-:\s]*([1-4])(?:[^0-9]+(20\d{2}))?', q)
     if m:
         qnum = int(m.group(1))
         year = int(m.group(2)) if m.group(2) else None
-        # If user said "FY" earlier, they would have been caught above; since we default to FY, interpret as FY quarter/year
         if year:
-            # Convert year in question to FinancialYear as user said default=FY
+            # since default is FY interpretation, map the year directly to FinancialYear
             filters.append({"column":"FinancialQuarter","operator":"=","value": qnum})
             filters.append({"column":"FinancialYear","operator":"=","value": year})
         else:
-            # no explicit year -> take current FY year or last? We'll leave quarter only
             filters.append({"column":"FinancialQuarter","operator":"=","value": qnum})
         return filters
 
     # explicit month + year: e.g., January 2024 or Jan 2024
-    m = re.search(r'\b('
-                  r'january|february|march|april|may|june|july|august|september|october|november|december|'
-                  r'jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec'
-                  r')\s+(20\d{2})\b', q, flags=re.IGNORECASE)
+    m = re.search(
+        r'\b('
+        r'january|february|march|april|may|june|july|august|september|october|november|december|'
+        r'jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec'
+        r')\s+(20\d{2})\b', q, flags=re.IGNORECASE)
     if m:
         mon = m.group(1)
         yr = int(m.group(2))
         cal_month = month_name_to_num(mon)
-        # user default mapping: plain year -> interpret as FY unless explicit "transaction" present
-        # We need both TransactionMonth/TransactionYear and FinancialMonth/FinancialYear mapping
-        # Since Q3: default interpret year as FY, we map month into FinancialMonth/FinancialYear
-        fy_month = calendar_to_fy_month(cal_month)
-        fy_year = calendar_to_fy_year(yr, cal_month)
-        filters.append({"column":"FinancialMonth","operator":"=","value": fy_month})
-        filters.append({"column":"FinancialYear","operator":"=","value": fy_year})
-        return filters
+        if cal_month:
+            fy_month = calendar_to_fy_month(cal_month)
+            fy_year = calendar_to_fy_year(yr, cal_month)
+            filters.append({"column":"FinancialMonth","operator":"=","value": fy_month})
+            filters.append({"column":"FinancialYear","operator":"=","value": fy_year})
+            return filters
 
-    # explicit calendar month/year if user mentions 'transaction' word
-    m = re.search(r'(transaction month|transaction year)\s*[:\-]?\s*(\d{1,2}|20\d{2})', q)
-    if m:
-        # fallback simple handling
-        return []
-
-    # last month / previous month (calendar or financial?)
-    if "last month" in q or "previous month" in q:
-        # we interpret as FinancialMonth & FinancialYear by default per Q3 (FY)
-        y,m = previous_calendar_month()
-        fy = calendar_to_fy_year(y,m)
+    # last month / previous month
+    if re.search(r'\blast month\b|\bprevious month\b', q):
+        y, m = previous_calendar_month()
+        fy = calendar_to_fy_year(y, m)
         fm = calendar_to_fy_month(m)
         filters.append({"column":"FinancialMonth","operator":"=","value": fm})
         filters.append({"column":"FinancialYear","operator":"=","value": fy})
         return filters
 
-    # last quarter / previous quarter
-    if "last quarter" in q or "previous quarter" in q:
+    # last quarter / previous quarter (use FY logic)
+    if re.search(r'\blast quarter\b|\bprevious quarter\b', q):
         fy, fq = last_financial_quarter()
         filters.append({"column":"FinancialQuarter","operator":"=","value": fq})
         filters.append({"column":"FinancialYear","operator":"=","value": fy})
         return filters
 
     # last year / previous year
-    if "last year" in q or "previous year" in q:
-        # default interpret as FinancialYear
+    if re.search(r'\blast year\b|\bprevious year\b', q):
+        # interpret as FinancialYear by default
         prev = previous_calendar_year()
         filters.append({"column":"FinancialYear","operator":"=","value": prev})
         return filters
 
-    # explicit 4-digit year (no FY word) — per Q3 we treat plain year as FinancialYear
+    # explicit calendar / transaction mention (if user says transaction year/month)
+    # Example: "transaction year 2024" -> use TransactionYear
+    m = re.search(r'\btransaction year\s*(20\d{2})\b', q)
+    if m:
+        yr = int(m.group(1))
+        filters.append({"column":"TransactionYear","operator":"=","value": yr})
+        return filters
+    m = re.search(r'\btransaction month\s*(\d{1,2})\b', q)
+    if m:
+        mon = int(m.group(1))
+        filters.append({"column":"TransactionMonth","operator":"=","value": mon})
+        return filters
+
+    # plain 4-digit year (no 'FY' word) -> per your preference treat as FinancialYear
     m = re.search(r'\b(20\d{2})\b', q)
     if m:
         yr = int(m.group(1))
-        # default to FinancialYear (user preference)
         filters.append({"column":"FinancialYear","operator":"=","value": yr})
         return filters
 
+    # Nothing found
     return filters
 
 # -------------------------
@@ -286,19 +311,21 @@ def normalize_plan(plan: dict):
      - Ensure only one instance of each dimension in SELECT
     """
     plan = dict(plan)  # shallow copy
-    selects = plan.get("select", [])
+    selects = plan.get("select", []) or []
     group_by = plan.get("group_by", []) or []
     order_by = plan.get("order_by", []) or []
 
     # sanitize aliases and expressions
     seen_aliases = set()
     clean_selects = []
+
     # first, ensure group_by unique & valid
     gb = []
     schema = get_schema()
     for g in group_by:
         if g and g not in gb and g in schema:
             gb.append(g)
+
     # ensure select includes group_by columns (if not present in LLM, add them)
     gb_in_select_aliases = set()
     for s in selects:
@@ -321,9 +348,8 @@ def normalize_plan(plan: dict):
         # if expression contains aggregate, don't aggregate it again
         if isinstance(expr, str) and is_aggregate_expression(expr):
             agg = None
-            # keep expression as-is
         # normalize aggregation value for JSON null/None
-        if agg is not None and (str(agg).lower() == "none" or agg == "null"):
+        if agg is not None and (str(agg).lower() == "none" or str(agg).lower() == "null"):
             agg = None
         # avoid duplicate dimension selects (if alias or column seen skip)
         if alias in seen_aliases or (col and col in seen_aliases):
@@ -333,7 +359,6 @@ def normalize_plan(plan: dict):
             seen_aliases.add(col)
         clean_selects.append({"column": col, "expression": expr, "aggregation": agg, "alias": alias})
 
-    # ensure we don't produce duplicate columns from group_by again
     # dedupe clean_selects while preserving order
     final_selects = []
     seen = set()
@@ -350,11 +375,12 @@ def normalize_plan(plan: dict):
         col = ob.get("column")
         if col in select_aliases or col in gb:
             valid_order_by.append(ob)
-    # if no order_by but limit present, keep existing metric alias if any
+
+    # final assembly
     plan["select"] = final_selects
     plan["group_by"] = gb
     plan["order_by"] = valid_order_by
-    plan["filters"] = plan.get("filters", [])
+    plan["filters"] = plan.get("filters", []) or []
     plan["limit"] = plan.get("limit")
     return plan
 
@@ -428,13 +454,19 @@ def extract_query(question: str):
     except Exception as e:
         return {"error": f"Failed to parse JSON: {e}", "json_received": json_text, "raw": raw}
 
-    # Add time filters parsed from text
+    # Add time filters parsed from text (ensuring primitive values)
     time_filters = parse_time_filters(question)
-    plan_filters = plan.get("filters", [])
-    # append only if not duplicate columns
+    plan_filters = plan.get("filters", []) or []
+    # append only if not duplicate columns and sanitize values
     for tf in time_filters:
+        # sanitize tf value
+        tf_value = sanitize_filter_value(tf.get("value"))
+        tf["value"] = tf_value
         if not any(f.get("column")==tf.get("column") for f in plan_filters):
             plan_filters.append(tf)
+    # sanitize any plan filters that may have dict-values
+    for f in plan_filters:
+        f["value"] = sanitize_filter_value(f.get("value"))
     plan["filters"] = plan_filters
 
     # Normalize plan (dedupe selects, remove nested agg, ensure group_by included)
