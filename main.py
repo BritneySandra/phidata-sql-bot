@@ -1,4 +1,4 @@
-# main.py — FINAL STABLE VERSION
+# main.py
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,21 +21,24 @@ app.add_middleware(
 
 TABLE = "WBI_BI_Data_V2"
 
+
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "API running"}
+
 
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
 
+
 # -------------------------------
-# Dark-mode ChatGPT-style UI
+# HTML Chat UI
 # -------------------------------
 @app.get("/chat", response_class=HTMLResponse)
 async def chat_ui():
     return """
-   <!DOCTYPE html>
+<!DOCTYPE html>
 <html>
 <head>
 <title>PhiData SQL Chatbot</title>
@@ -123,9 +126,11 @@ async function ask() {
             html += "</tr>";
         });
         html += "</table>";
+        html += "<br><b>Summary:</b><br>" + (data.result || "");
     } else {
         html += "<b>Answer:</b><br>" + (data.result || "No data");
     }
+
     document.getElementById("a").innerHTML = html;
 }
 </script>
@@ -142,67 +147,51 @@ class Query(BaseModel):
 async def ask(q: Query):
     schema = get_schema()
 
-    # 1) Extract plan from LLM
-    plan = extract_query(q.question)
-
-    # ---- SAFETY FIXES ----
-    if not isinstance(plan, dict):
-        return {
-            "sql": None,
-            "result": f"Invalid response from AI model: {plan}",
-            "rows": [],
-            "columns": []
-        }
-
-    if "error" in plan:
-        return {
-            "sql": None,
-            "result": f"AI error: {plan['error']}",
-            "rows": [],
-            "columns": []
-        }
-
-    required_keys = ["select", "filters", "group_by", "order_by", "limit"]
-    if not all(k in plan for k in required_keys):
-        return {
-            "sql": None,
-            "result": f"AI returned incomplete plan: {plan}",
-            "rows": [],
-            "columns": []
-        }
-
     try:
-        # 2) Build SQL
+        # 1) LLM → Plan
+        plan = extract_query(q.question)
+
+        if "error" in plan:
+            return {"sql": None, "result": "AI error: " + str(plan["error"]), "rows": [], "columns": []}
+
+        # 2) Plan → SQL
         sql, params, columns = build_sql_from_plan(plan, TABLE, schema)
 
-        # 3) Execute SQL
+        # 3) SQL → Data
         rows = run_sql(sql, params)
 
+        # 4) Natural language answer
         if not rows:
-            return {
-                "sql": sql,
-                "result": "No data found",
-                "rows": [],
-                "columns": columns
-            }
+            return {"sql": sql, "result": "No data found.", "rows": [], "columns": columns}
 
-        # Human-friendly summary
+        # Natural language for 1 metric only
         if len(rows) == 1 and len(columns) == 1:
-            value = rows[0][columns[0]]
+            col = columns[0]
+            val = rows[0][col]
             try:
-                value_fmt = f"{value:,}"
+                val_fmt = f"{val:,}"
             except:
-                value_fmt = value
-            summary = f"{columns[0]} = {value_fmt}"
-        else:
-            summary = f"{len(rows)} rows returned."
+                val_fmt = str(val)
 
-        return {"sql": sql, "result": summary, "rows": rows, "columns": columns}
+            friendly = col.replace("_", " ").replace("-", " ").capitalize()
+            summary = f"The {friendly} is {val_fmt}."
+        else:
+            summary = f"I found {len(rows)} records for your query."
+
+        return {
+            "sql": sql,
+            "result": summary,
+            "rows": rows,
+            "columns": columns
+        }
 
     except Exception as e:
-        return {
-            "sql": None,
-            "result": f"SQL execution error: {e}",
-            "rows": [],
-            "columns": []
-        }
+        return JSONResponse(
+            status_code=200,
+            content={
+                "sql": locals().get("sql", None),
+                "result": f"Error: {e}",
+                "rows": [],
+                "columns": []
+            }
+        )
