@@ -1,17 +1,19 @@
-# sql_runner.py - execute SQL and return rows
+# sql_runner.py - safe SQL executor
 import pyodbc
-import pandas as pd
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
-def run_sql(sql, params=None):
+def run_sql(sql: str, params=None):
     """
-    Executes a SQL query and returns (columns, rows)
-    Returns (None, error_message) when SQL fails.
+    Execute SQL and return:
+    {
+        "columns": [...],
+        "rows": [ [...], [...], ... ]
+    }
+    Always JSON-serializable.
     """
-    conn = None
     try:
         conn = pyodbc.connect(
             f"DRIVER={{ODBC Driver 18 for SQL Server}};"
@@ -22,25 +24,28 @@ def run_sql(sql, params=None):
             f"Encrypt=no;TrustServerCertificate=yes;",
             timeout=10,
         )
-
         cur = conn.cursor()
 
-        # Execute with parameters
         if params:
             cur.execute(sql, params)
         else:
             cur.execute(sql)
 
-        rows = cur.fetchall()
+        # Get column names
+        columns = [c[0] for c in cur.description]
 
-        # Extract column names
-        cols = [column[0] for column in cur.description]
+        # Convert all row objects → Python lists
+        raw_rows = cur.fetchall()
+        rows = [list(r) for r in raw_rows]
 
-        return cols, rows
+        conn.close()
+        return {
+            "columns": columns,
+            "rows": rows
+        }
 
     except Exception as e:
-        return None, str(e)
-
-    finally:
-        if conn:
-            conn.close()
+        return {
+            "error": str(e),
+            "sql": sql
+        }
