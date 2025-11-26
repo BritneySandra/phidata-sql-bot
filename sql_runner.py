@@ -6,33 +6,33 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-def run_sql(sql, params=None):
+def run_sql_query(sql, params=None):
+    import pyodbc
+
     conn = pyodbc.connect(
         f"DRIVER={{ODBC Driver 18 for SQL Server}};"
         f"SERVER={os.getenv('SQL_SERVER')};"
         f"DATABASE={os.getenv('SQL_DATABASE')};"
         f"UID={os.getenv('SQL_USERNAME')};"
         f"PWD={os.getenv('SQL_PASSWORD')};"
-        "Encrypt=no;TrustServerCertificate=yes;"
+        f"Encrypt=no;TrustServerCertificate=yes;",
+        timeout=10,
     )
-
-    # 🔥 FIX: CLEAN PARAMS BEFORE EXECUTION
-    clean_params = []
-    if params:
-        for p in params:
-            if p is None:
-                clean_params.append(None)
-            elif isinstance(p, str):
-                clean_params.append(p.strip().upper())   # normalize to uppercase
-            else:
-                clean_params.append(p)
+    cur = conn.cursor()
 
     try:
-        df = pd.read_sql(sql, conn, params=clean_params)
-    finally:
+        if params:
+            cur.execute(sql, params)
+        else:
+            cur.execute(sql)
+
+        rows = cur.fetchall()
+        cols = [c[0] for c in cur.description]
         conn.close()
 
-    if df is None or df.empty:
-        return []
-    return df.to_dict(orient="records")
+        return cols, rows
+
+    except Exception as e:
+        conn.close()
+        return None, str(e)
 
