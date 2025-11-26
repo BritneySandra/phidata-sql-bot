@@ -158,10 +158,6 @@ def build_sql_from_plan(plan, table, schema):
     # -------------------------------------------------------------
     # Fallback ordering when LIMIT is used and no ORDER BY
     # -------------------------------------------------------------
-    elif limit and metric_alias:
-        sql += f" ORDER BY [{metric_alias}] DESC"
-
-    # -------------------------------------------------------------
     # LIMIT / TOP
     # -------------------------------------------------------------
     if limit:

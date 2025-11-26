@@ -582,7 +582,7 @@ def extract_query(question: str):
             selects.insert(0, {"column": dim_col, "expression": None, "aggregation": None, "alias": dim_col})
 
     # apply top limit
-    if top_n and not limit:
+    if top_n:
         plan["limit"] = top_n
 
     # ordering semantics
