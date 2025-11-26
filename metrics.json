@@ -1,24 +1,24 @@
 {
   "revenue": {
-    "expression": "[REVAmount] + [WIPAmount]",
+    "expression": "COALESCE([REVAmount],0) + COALESCE([WIPAmount],0)",
     "aggregation": "SUM",
     "synonyms": ["revenue", "sales", "turnover", "income", "rev"]
   },
 
   "cost": {
-    "expression": "[CSTAmount] + [ACRAmount]",
+    "expression": "COALESCE([CSTAmount],0) + COALESCE([ACRAmount],0)",
     "aggregation": "SUM",
     "synonyms": ["cost", "expenses", "total cost", "service cost"]
   },
 
   "profit": {
-    "expression": "[JobProfit]",
+    "expression": "COALESCE([JobProfit],0)",
     "aggregation": "SUM",
     "synonyms": ["profit", "margin", "jobprofit", "earning"]
   },
 
   "profit_percentage": {
-    "expression": "CASE WHEN SUM([CSTAmount] + [ACRAmount]) = 0 THEN NULL ELSE (SUM([JobProfit]) / SUM([CSTAmount] + [ACRAmount])) * 100 END",
+    "expression": "CASE WHEN SUM(COALESCE([CSTAmount],0) + COALESCE([ACRAmount],0)) = 0 THEN NULL ELSE (SUM(COALESCE([JobProfit],0)) / SUM(COALESCE([CSTAmount],0) + COALESCE([ACRAmount],0))) * 100 END",
     "aggregation": null,
     "synonyms": ["profit percent", "profit %", "margin %", "profit ratio"]
   },
@@ -30,25 +30,25 @@
   },
 
   "total_volume": {
-    "expression": "SUM([ActualChargeable])",
+    "expression": "SUM(COALESCE([ActualChargeable],0))",
     "aggregation": null,
     "synonyms": ["volume", "total volume", "sum volume"]
   },
 
   "usd_revenue": {
-    "expression": "[USDREVAmount]",
+    "expression": "COALESCE([USDREVAmount],0)",
     "aggregation": "SUM",
     "synonyms": ["usd revenue", "revenue usd", "converted revenue", "rev usd"]
   },
 
   "trade_lane_continent": {
-    "expression": "[OriginContinent] + '-' + [DestinationContinent]",
+    "expression": "COALESCE([OriginContinent],'') + '-' + COALESCE([DestinationContinent],'')",
     "aggregation": null,
     "synonyms": ["continent trade lane", "trade lane continent", "origin-destination continent"]
   },
 
   "trade_lane_country": {
-    "expression": "[OriginCountry] + '-' + [DestinationCountry]",
+    "expression": "COALESCE([OriginCountry],'') + '-' + COALESCE([DestinationCountry],'')",
     "aggregation": null,
     "synonyms": ["country trade lane", "trade lane country", "origin-destination country"]
   },
