@@ -503,10 +503,17 @@ def coerce_plan_shapes(plan):
 ############################################################
 # MAIN extract_query()
 ############################################################
+# MAIN extract_query()
 def extract_query(question: str):
+    """
+    Build a normalized plan for the question.
+    Guarantees at least one valid SELECT expression by using metric fallback,
+    and returns an error dict if it cannot interpret the question.
+    """
     schema = get_schema()
     client = get_client()
 
+    # Build prompt and call model if available
     prompt = build_prompt(question, schema, METADATA, METRICS)
     model = choose_best_groq_model(client) if client else None
 
@@ -514,33 +521,37 @@ def extract_query(question: str):
     if client and model:
         try:
             plan = call_model_and_get_plan(client, model, prompt)
-        except Exception:
+        except Exception as e:
+            # model failed -> fallback silently to deterministic route
             plan = None
 
+    # If model returned nothing, attempt metric fallback
     if not plan:
         metric = detect_metric_from_text(question)
         if metric:
             plan = build_plan_from_metric(metric, question)
         else:
-            return {"error": "Cannot interpret question"}
+            # No model output and no detected metric -> give helpful error
+            return {"error": "Cannot interpret question (no model output and no metric detected)"}
 
     # Coerce shapes early to avoid .get on strings
-    plan = coerce_plan_shapes(plan)
+    plan = coerce_plan_shapes(plan or {})
 
-    # TIME filters authoritative
+    # TIME filters authoritative (always apply)
     time_filters = parse_time_filters(question)
-    # STRICT value filters
+    # STRICT value filters (only when column mentioned explicitly)
     value_filters = extract_value_filters(question, schema)
 
+    # merge filters: time filters first, then other plan filters (avoid duplicate time cols)
     merged_filters = list(time_filters)
-    time_cols = {f["column"] for f in time_filters if isinstance(f, dict) and f.get("column")}
-    for f in plan.get("filters", []):
+    time_cols = {f.get("column") for f in time_filters if isinstance(f, dict) and f.get("column")}
+    for f in plan.get("filters", []) or []:
         if not isinstance(f, dict):
             continue
         if f.get("column") not in time_cols:
             merged_filters.append(f)
 
-    # add strict value filters (only if column not already present)
+    # add strict value filters if not already present
     existing_cols = {f.get("column") for f in merged_filters if isinstance(f, dict) and f.get("column")}
     for vf in value_filters:
         if vf.get("column") not in existing_cols:
@@ -548,17 +559,17 @@ def extract_query(question: str):
 
     plan["filters"] = merged_filters
 
-    # extract selects/group/order/limit safely
+    # normalize the plan structures
     selects = plan.get("select", []) or []
     group_by = plan.get("group_by", []) or []
     order_by = plan.get("order_by", []) or []
     limit = plan.get("limit")
 
-    # detect dimension & top/direction
+    # detect dimension & top/direction (deterministic)
     dim_col = detect_dimension_from_text(question, schema)
     top_n, direction, has_top = extract_top_n_and_direction(question)
 
-    # metric alias detection: safe access
+    # metric alias detection
     metric_alias = None
     for s in selects:
         if isinstance(s, dict) and (s.get("aggregation") or s.get("expression")):
@@ -567,7 +578,7 @@ def extract_query(question: str):
     if not metric_alias and selects and isinstance(selects[0], dict):
         metric_alias = selects[0].get("alias") or selects[0].get("column") or "value"
 
-    # ensure dimension in group_by and select
+    # ensure dimension in group_by and select if detected
     if dim_col:
         # prefer exact case from schema
         if schema:
@@ -581,7 +592,7 @@ def extract_query(question: str):
         if not dim_present:
             selects.insert(0, {"column": dim_col, "expression": None, "aggregation": None, "alias": dim_col})
 
-    # apply top limit
+    # apply top limit if found
     if top_n:
         plan["limit"] = top_n
 
@@ -597,6 +608,57 @@ def extract_query(question: str):
     plan["group_by"] = group_by
     plan["order_by"] = order_by
 
-    # final normalization to ensure consistent shapes
+    # Final normalization
     plan = normalize_plan(plan)
+
+    # ---- IMPORTANT GUARANTEE: ensure we have at least one valid select expression ----
+    # A valid select is a dict with either 'column' (non-empty string) or 'expression' (non-empty string).
+    valid_selects = []
+    for s in plan.get("select", []) or []:
+        if isinstance(s, dict):
+            col = s.get("column")
+            expr = s.get("expression")
+            # accept if column exists or expression present and non-empty
+            if (isinstance(col, str) and col.strip()) or (isinstance(expr, str) and expr.strip()):
+                valid_selects.append(s)
+
+    if not valid_selects:
+        # try to detect a metric deterministically and add it
+        metric = detect_metric_from_text(question)
+        if metric:
+            fallback = build_plan_from_metric(metric, question)
+            if fallback and isinstance(fallback, dict):
+                # merge time filters again to fallback
+                tfs = parse_time_filters(question)
+                fallback_filters = fallback.get("filters", []) or []
+                for t in tfs:
+                    if t not in fallback_filters:
+                        fallback_filters.append(t)
+                fallback["filters"] = fallback_filters
+                # coerce and normalize fallback then use it
+                fb = coerce_plan_shapes(fallback)
+                fb = normalize_plan(fb)
+                # use fb.select if valid
+                fb_selects = fb.get("select", []) or []
+                fb_valid = []
+                for s in fb_selects:
+                    if isinstance(s, dict):
+                        c = s.get("column")
+                        e = s.get("expression")
+                        if (isinstance(c, str) and c.strip()) or (isinstance(e, str) and e.strip()):
+                            fb_valid.append(s)
+                if fb_valid:
+                    plan["select"] = fb_selects
+                    # ensure group_by/filters preserved
+                    plan["filters"] = list(set(tuple(sorted(f.items())) for f in plan.get("filters", []))) if plan.get("filters") else plan.get("filters")
+                    plan = normalize_plan(plan)
+                else:
+                    # fatal: fallback metric didn't produce valid selects
+                    return {"error": "AI returned plan without valid SELECT expressions; fallback metric also invalid", "plan": plan}
+            else:
+                return {"error": "AI returned plan without valid SELECT expressions and no fallback metric available", "plan": plan}
+        else:
+            return {"error": "AI returned plan without valid SELECT expressions and no metric detected", "plan": plan}
+
+    # final safe return
     return plan
