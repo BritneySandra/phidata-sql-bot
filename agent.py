@@ -503,17 +503,11 @@ def coerce_plan_shapes(plan):
 ############################################################
 # MAIN extract_query()
 ############################################################
-# MAIN extract_query()
 def extract_query(question: str):
-    """
-    Build a normalized plan for the question.
-    Guarantees at least one valid SELECT expression by using metric fallback,
-    and returns an error dict if it cannot interpret the question.
-    """
     schema = get_schema()
     client = get_client()
 
-    # Build prompt and call model if available
+    # --- 1) Build prompt & try LLM ---
     prompt = build_prompt(question, schema, METADATA, METRICS)
     model = choose_best_groq_model(client) if client else None
 
@@ -521,86 +515,111 @@ def extract_query(question: str):
     if client and model:
         try:
             plan = call_model_and_get_plan(client, model, prompt)
-        except Exception as e:
-            # model failed -> fallback silently to deterministic route
+        except:
             plan = None
 
-    # If model returned nothing, attempt metric fallback
+    # --- 2) If model fails, fallback to metric-based plan ---
     if not plan:
         metric = detect_metric_from_text(question)
         if metric:
             plan = build_plan_from_metric(metric, question)
         else:
-            # No model output and no detected metric -> give helpful error
             return {"error": "Cannot interpret question (no model output and no metric detected)"}
 
-    # Coerce shapes early to avoid .get on strings
+    # --- 3) Coerce shapes BEFORE any logic ---
     plan = coerce_plan_shapes(plan or {})
 
-    # TIME filters authoritative (always apply)
+    # --- 4) Apply TIME FILTERS & STRICT VALUE FILTERS ---
     time_filters = parse_time_filters(question)
-    # STRICT value filters (only when column mentioned explicitly)
     value_filters = extract_value_filters(question, schema)
 
-    # merge filters: time filters first, then other plan filters (avoid duplicate time cols)
     merged_filters = list(time_filters)
-    time_cols = {f.get("column") for f in time_filters if isinstance(f, dict) and f.get("column")}
-    for f in plan.get("filters", []) or []:
-        if not isinstance(f, dict):
-            continue
-        if f.get("column") not in time_cols:
+    time_cols = {f.get("column") for f in time_filters}
+
+    for f in plan.get("filters", []):
+        if isinstance(f, dict) and f.get("column") not in time_cols:
             merged_filters.append(f)
 
-    # add strict value filters if not already present
-    existing_cols = {f.get("column") for f in merged_filters if isinstance(f, dict) and f.get("column")}
+    # strict filters
+    existing_cols = {f.get("column") for f in merged_filters}
     for vf in value_filters:
         if vf.get("column") not in existing_cols:
             merged_filters.append(vf)
 
     plan["filters"] = merged_filters
 
-    # normalize the plan structures
+    # --- 5) Extract raw structures ---
     selects = plan.get("select", []) or []
     group_by = plan.get("group_by", []) or []
     order_by = plan.get("order_by", []) or []
     limit = plan.get("limit")
 
-    # detect dimension & top/direction (deterministic)
+    # ----------------------------------------------------------
+    # 🔥 6) FORCE METRIC DETECTED FROM QUESTION (NEW FIX)
+    # ----------------------------------------------------------
+    metric_key = detect_metric_from_text(question)
+    if metric_key and metric_key in METRICS:
+        metric_info = METRICS[metric_key]
+        expr = metric_info.get("expression")
+        agg = metric_info.get("aggregation")
+        alias = metric_key
+
+        already = any(
+            isinstance(s, dict) and (s.get("alias") == alias)
+            for s in selects
+        )
+
+        if not already:
+            selects.append({
+                "column": None,
+                "expression": expr,
+                "aggregation": agg,
+                "alias": alias
+            })
+
+    # --- Update plan ---
+    plan["select"] = selects
+
+    # --- 7) Detect dimension & TOP-N ---
     dim_col = detect_dimension_from_text(question, schema)
     top_n, direction, has_top = extract_top_n_and_direction(question)
 
-    # metric alias detection
-    metric_alias = None
-    for s in selects:
-        if isinstance(s, dict) and (s.get("aggregation") or s.get("expression")):
-            metric_alias = s.get("alias") or s.get("column") or "value"
-            break
-    if not metric_alias and selects and isinstance(selects[0], dict):
-        metric_alias = selects[0].get("alias") or selects[0].get("column") or "value"
-
-    # ensure dimension in group_by and select if detected
+    # --- 8) Dimension → add to SELECT & GROUP BY ---
     if dim_col:
-        # prefer exact case from schema
-        if schema:
-            for col in schema.keys():
-                if col.lower() == dim_col.lower():
-                    dim_col = col
-                    break
+        for col in schema.keys():
+            if col.lower() == dim_col.lower():
+                dim_col = col
+                break
+
         if dim_col not in group_by:
             group_by.insert(0, dim_col)
-        dim_present = any(isinstance(s, dict) and (s.get("column") == dim_col or s.get("alias") == dim_col) for s in selects)
-        if not dim_present:
-            selects.insert(0, {"column": dim_col, "expression": None, "aggregation": None, "alias": dim_col})
 
-    # apply top limit if found
+        dim_present = any(
+            isinstance(s, dict) and (s.get("alias") == dim_col or s.get("column") == dim_col)
+            for s in selects
+        )
+        if not dim_present:
+            selects.insert(0, {
+                "column": dim_col,
+                "expression": None,
+                "aggregation": None,
+                "alias": dim_col
+            })
+
+    # --- 9) TOP N ---
     if top_n:
         plan["limit"] = top_n
 
-    # ordering semantics
+    # --- 10) Ordering logic ---
+    metric_alias = None
+    for s in selects:
+        if isinstance(s, dict) and (s.get("aggregation") or s.get("expression")):
+            metric_alias = s.get("alias")
+            break
+
     if metric_alias:
         if direction:
-            order_by = [o for o in order_by if not (isinstance(o, dict) and o.get("column") == metric_alias)]
-            order_by.insert(0, {"column": metric_alias, "direction": direction})
+            order_by = [{"column": metric_alias, "direction": direction}]
         elif dim_col and not order_by:
             order_by = [{"column": metric_alias, "direction": "DESC"}]
 
@@ -608,57 +627,26 @@ def extract_query(question: str):
     plan["group_by"] = group_by
     plan["order_by"] = order_by
 
-    # Final normalization
+    # --- 11) Normalize plan ---
     plan = normalize_plan(plan)
 
-    # ---- IMPORTANT GUARANTEE: ensure we have at least one valid select expression ----
-    # A valid select is a dict with either 'column' (non-empty string) or 'expression' (non-empty string).
-    valid_selects = []
-    for s in plan.get("select", []) or []:
+    # ----------------------------------------------------------
+    # 12) FINAL SAFETY: Ensure SELECT is NEVER empty
+    # ----------------------------------------------------------
+    valid = []
+    for s in plan.get("select", []):
         if isinstance(s, dict):
-            col = s.get("column")
-            expr = s.get("expression")
-            # accept if column exists or expression present and non-empty
-            if (isinstance(col, str) and col.strip()) or (isinstance(expr, str) and expr.strip()):
-                valid_selects.append(s)
+            c = s.get("column")
+            e = s.get("expression")
+            if (c and c.strip()) or (e and e.strip()):
+                valid.append(s)
 
-    if not valid_selects:
-        # try to detect a metric deterministically and add it
+    if not valid:
+        # fallback metric again
         metric = detect_metric_from_text(question)
         if metric:
-            fallback = build_plan_from_metric(metric, question)
-            if fallback and isinstance(fallback, dict):
-                # merge time filters again to fallback
-                tfs = parse_time_filters(question)
-                fallback_filters = fallback.get("filters", []) or []
-                for t in tfs:
-                    if t not in fallback_filters:
-                        fallback_filters.append(t)
-                fallback["filters"] = fallback_filters
-                # coerce and normalize fallback then use it
-                fb = coerce_plan_shapes(fallback)
-                fb = normalize_plan(fb)
-                # use fb.select if valid
-                fb_selects = fb.get("select", []) or []
-                fb_valid = []
-                for s in fb_selects:
-                    if isinstance(s, dict):
-                        c = s.get("column")
-                        e = s.get("expression")
-                        if (isinstance(c, str) and c.strip()) or (isinstance(e, str) and e.strip()):
-                            fb_valid.append(s)
-                if fb_valid:
-                    plan["select"] = fb_selects
-                    # ensure group_by/filters preserved
-                    plan["filters"] = list(set(tuple(sorted(f.items())) for f in plan.get("filters", []))) if plan.get("filters") else plan.get("filters")
-                    plan = normalize_plan(plan)
-                else:
-                    # fatal: fallback metric didn't produce valid selects
-                    return {"error": "AI returned plan without valid SELECT expressions; fallback metric also invalid", "plan": plan}
-            else:
-                return {"error": "AI returned plan without valid SELECT expressions and no fallback metric available", "plan": plan}
-        else:
-            return {"error": "AI returned plan without valid SELECT expressions and no metric detected", "plan": plan}
+            return build_plan_from_metric(metric, question)
+        return {"error": "No valid SELECT expressions even after metric injection"}
 
-    # final safe return
     return plan
+
