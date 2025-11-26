@@ -1,4 +1,5 @@
 # agent.py — CLEAN + STRICT VALUE FILTERS + stable dimension/TOP/time logic
+# Updated to coerce plan shapes to avoid "'str' object has no attribute 'get'"
 
 import os
 import json
@@ -68,7 +69,6 @@ DIMENSION_MAP = {
     "jobstatus": "JobStatus",
 }
 
-# synonyms for detecting dimension columns
 DIMENSION_SYNONYMS = {
     "customer": ["customer", "client", "customer group", "customerleadgroup"],
     "branch": ["branch", "office", "location"],
@@ -80,7 +80,6 @@ DIMENSION_SYNONYMS = {
     "job status": ["job status", "jobstatus"],
 }
 
-# build lookup
 DIM_LOOKUP = {}
 for key, col in DIMENSION_MAP.items():
     DIM_LOOKUP[key.lower()] = col
@@ -181,12 +180,10 @@ def previous_calendar_year(ref=None):
 def parse_time_filters(text: str):
     q = (text or "").lower()
 
-    # FY 2024
     m = re.search(r"\b(?:fy|financial year)\s*(20\d{2})\b", q)
     if m:
         return [{"column": "FinancialYear", "operator": "=", "value": int(m.group(1))}]
 
-    # Quarter
     m = re.search(r"\b(?:q|quarter)\s*([1-4])(?:.*?(20\d{2}))?", q)
     if m:
         qn = int(m.group(1))
@@ -195,7 +192,6 @@ def parse_time_filters(text: str):
         if yr: out.append({"column": "FinancialYear", "operator": "=", "value": yr})
         return out
 
-    # Month + year
     m = re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(20\d{2})\b", q)
     if m:
         month = datetime.strptime(m.group(1)[:3], "%b").month
@@ -205,7 +201,6 @@ def parse_time_filters(text: str):
             {"column": "FinancialYear", "operator": "=", "value": calendar_to_fy_year(yr, month)},
         ]
 
-    # previous month
     if "previous month" in q or "last month" in q:
         y, mth = previous_calendar_month()
         return [
@@ -213,7 +208,6 @@ def parse_time_filters(text: str):
             {"column": "FinancialYear", "operator": "=", "value": calendar_to_fy_year(y, mth)},
         ]
 
-    # last quarter
     if "previous quarter" in q or "last quarter" in q:
         fy, fq = last_financial_quarter()
         return [
@@ -221,11 +215,9 @@ def parse_time_filters(text: str):
             {"column": "FinancialYear", "operator": "=", "value": fy},
         ]
 
-    # last year
     if "previous year" in q or "last year" in q:
         return [{"column": "FinancialYear", "operator": "=", "value": previous_calendar_year()}]
 
-    # plain year
     m = re.search(r"\b(20\d{2})\b", q)
     if m:
         return [{"column": "FinancialYear", "operator": "=", "value": int(m.group(1))}]
@@ -241,62 +233,68 @@ def extract_value_filters(question: str, schema: dict):
     STRICT MODE:
     Only extract values if the user explicitly mentions the COLUMN NAME.
     Example:
-        "transport mode sea" → TransportMode = 'sea'
-        "sea shipments" → NO filter
+        "transport mode sea" -> TransportMode = 'sea'
+        "sea shipments" -> NO filter
     """
     q = question.lower()
     filters = []
 
+    if not schema:
+        return filters
+
     for col in schema.keys():
         col_low = col.lower()
-
-        # must mention column name exactly
+        # require column token present
         if col_low not in q:
             continue
-
-        # after the column, capture the next word as value
-        m = re.search(rf"{col_low}\s*(?:is|=|:)?\s*([a-zA-Z0-9]+)", q)
+        # capture next token after column mention as value (letters/numbers/-,_)
+        m = re.search(rf"{re.escape(col_low)}\s*(?:is|=|:)?\s*([a-zA-Z0-9\-_]+)", q)
         if m:
             val = m.group(1)
             filters.append({"column": col, "operator": "=", "value": val})
-
     return filters
 
 
 ############################################################
 # METRIC + DIM DETECT
 ############################################################
-DESC_KEYWORDS = {"top", "highest", "greater", "max", "most"}
+DESC_KEYWORDS = {"top", "highest", "greater", "max", "most", "biggest"}
 ASC_KEYWORDS = {"least", "lowest", "min", "smallest", "bottom"}
 
 def extract_top_n_and_direction(text: str):
     t = (text or "").lower()
     n = None
-    m = re.search(r"top\s+(\d+)", t)
+    m = re.search(r"\btop\s+(\d+)\b", t)
     if m: n = int(m.group(1))
 
     direction = None
     for w in DESC_KEYWORDS:
-        if w in t: direction = "DESC"
+        if re.search(r"\b" + re.escape(w) + r"\b", t):
+            direction = "DESC"
+            break
     for w in ASC_KEYWORDS:
-        if w in t: direction = "ASC"
+        if re.search(r"\b" + re.escape(w) + r"\b", t):
+            direction = "ASC"
+            break
 
     return n, direction, "top" in t
 
 
 def detect_dimension_from_text(text: str, schema: dict):
     t = (text or "").lower()
-    for col in schema.keys():
-        if col.lower() in t:
-            return col
+    if schema:
+        for col in schema.keys():
+            if col.lower() in t:
+                return col
     for syn, col in DIM_LOOKUP.items():
-        if syn in t and col in schema:
-            return col
+        if syn in t:
+            if not schema or col in schema:
+                return col
     return None
 
 
 def detect_metric_from_text(text: str):
-    t = text.lower()
+    t = (text or "").lower()
     for syn, metric in SYNONYM_MAP.items():
         if syn in t:
             return metric
@@ -321,13 +319,10 @@ def build_plan_from_metric(metric_key, question_text):
         sel = {"column": None, "expression": expr, "aggregation": agg, "alias": alias}
 
     plan = {"select": [sel], "filters": [], "group_by": [], "order_by": [], "limit": None}
-
-    # add time filters
     tfs = parse_time_filters(question_text)
     for t in tfs:
         t["value"] = t.get("value")
     plan["filters"].extend(tfs)
-
     return plan
 
 
@@ -365,7 +360,6 @@ def call_model_and_get_plan(client, model, prompt):
     if s == -1 or e == -1:
         raise ValueError("No JSON returned")
     txt = raw[s:e+1]
-
     try:
         return json.loads(txt)
     except:
@@ -379,10 +373,8 @@ def call_model_and_get_plan(client, model, prompt):
 # NORMALIZE PLAN
 ############################################################
 AGG_RE = re.compile(r"^\s*(sum|avg|count|min|max)\s*\(", re.IGNORECASE)
-
 def is_aggregate_expression(expr):
     return bool(expr and isinstance(expr, str) and AGG_RE.match(expr.strip()))
-
 
 def normalize_plan(plan):
     plan = dict(plan or {})
@@ -392,16 +384,18 @@ def normalize_plan(plan):
     filters = plan.get("filters", []) or []
     limit = plan.get("limit")
 
-    schema = get_schema()
+    schema = get_schema() or {}
 
     # clean group_by
-    group_by = [g for g in group_by if isinstance(g, str) and g in schema]
+    gb_clean = []
+    for g in group_by:
+        if isinstance(g, str) and (not schema or g in schema):
+            gb_clean.append(g)
 
-    # ensure group_by cols in select
     clean_selects = []
     seen_alias = set()
-
-    for g in group_by:
+    # ensure group_by columns are first in select
+    for g in gb_clean:
         clean_selects.append({"column": g, "expression": None, "aggregation": None, "alias": g})
         seen_alias.add(g)
 
@@ -418,21 +412,90 @@ def normalize_plan(plan):
             clean_selects.append({"column": col, "expression": expr, "aggregation": agg, "alias": alias})
             seen_alias.add(alias)
 
-    # clean order_by
-    valid_alias = {s["alias"] for s in clean_selects}
+    valid_aliases = {s["alias"] for s in clean_selects}
     clean_order = []
     for o in order_by:
         if not isinstance(o, dict):
             continue
         col = o.get("column")
-        if col in valid_alias or col in group_by:
-            clean_order.append(o)
+        direction = o.get("direction", "DESC") or "DESC"
+        if col in valid_aliases or col in gb_clean:
+            clean_order.append({"column": col, "direction": direction})
 
     plan["select"] = clean_selects
-    plan["group_by"] = group_by
+    plan["group_by"] = gb_clean
     plan["order_by"] = clean_order
     plan["filters"] = filters
     plan["limit"] = limit
+    return plan
+
+
+############################################################
+# HELP: coerce plan shape (pre-normalization) to avoid string.get errors
+############################################################
+def coerce_plan_shapes(plan):
+    """
+    Ensure plan['select'] is list of dicts (if items are strings -> convert to {'alias':str})
+    Ensure plan['filters'] is list of dicts
+    Ensure plan['order_by'] is list of dicts
+    Ensure plan['group_by'] is list of strings
+    """
+    if not isinstance(plan, dict):
+        return plan
+
+    # selects
+    s = plan.get("select", [])
+    if s is None:
+        s = []
+    coerced_selects = []
+    for item in s:
+        if isinstance(item, dict):
+            coerced_selects.append(item)
+        elif isinstance(item, str):
+            coerced_selects.append({"column": None, "expression": None, "aggregation": None, "alias": item})
+        else:
+            # unknown type -> skip
+            continue
+    plan["select"] = coerced_selects
+
+    # filters
+    f = plan.get("filters", [])
+    if f is None:
+        f = []
+    coerced_filters = []
+    for item in f:
+        if isinstance(item, dict):
+            coerced_filters.append(item)
+        else:
+            # skip non-dicts
+            continue
+    plan["filters"] = coerced_filters
+
+    # order_by
+    ob = plan.get("order_by", [])
+    if ob is None:
+        ob = []
+    coerced_ob = []
+    for item in ob:
+        if isinstance(item, dict):
+            coerced_ob.append(item)
+        elif isinstance(item, str):
+            coerced_ob.append({"column": item, "direction": "DESC"})
+        else:
+            continue
+    plan["order_by"] = coerced_ob
+
+    # group_by
+    gb = plan.get("group_by", []) or []
+    coerced_gb = []
+    for item in gb:
+        if isinstance(item, str):
+            coerced_gb.append(item)
+        elif isinstance(item, dict):
+            col = item.get("column")
+            if isinstance(col, str):
+                coerced_gb.append(col)
+    plan["group_by"] = coerced_gb
 
     return plan
 
@@ -451,7 +514,7 @@ def extract_query(question: str):
     if client and model:
         try:
             plan = call_model_and_get_plan(client, model, prompt)
-        except:
+        except Exception:
             plan = None
 
     if not plan:
@@ -461,59 +524,72 @@ def extract_query(question: str):
         else:
             return {"error": "Cannot interpret question"}
 
-    # TIME FILTERS (authoritative)
-    time_filters = parse_time_filters(question)
+    # Coerce shapes early to avoid .get on strings
+    plan = coerce_plan_shapes(plan)
 
-    # STRICT VALUE FILTERS (new)
+    # TIME filters authoritative
+    time_filters = parse_time_filters(question)
+    # STRICT value filters
     value_filters = extract_value_filters(question, schema)
 
-    # merge filters
     merged_filters = list(time_filters)
-
-    # model filters but override time filters
-    time_cols = {f["column"] for f in time_filters}
+    time_cols = {f["column"] for f in time_filters if isinstance(f, dict) and f.get("column")}
     for f in plan.get("filters", []):
+        if not isinstance(f, dict):
+            continue
         if f.get("column") not in time_cols:
             merged_filters.append(f)
 
-    # add strict value filters
+    # add strict value filters (only if column not already present)
+    existing_cols = {f.get("column") for f in merged_filters if isinstance(f, dict) and f.get("column")}
     for vf in value_filters:
-        if vf["column"] not in {f["column"] for f in merged_filters}:
+        if vf.get("column") not in existing_cols:
             merged_filters.append(vf)
 
     plan["filters"] = merged_filters
 
-    # TOP-N and DIMENSION logic
+    # extract selects/group/order/limit safely
     selects = plan.get("select", []) or []
     group_by = plan.get("group_by", []) or []
     order_by = plan.get("order_by", []) or []
     limit = plan.get("limit")
 
+    # detect dimension & top/direction
     dim_col = detect_dimension_from_text(question, schema)
     top_n, direction, has_top = extract_top_n_and_direction(question)
 
-    # metric alias
+    # metric alias detection: safe access
     metric_alias = None
     for s in selects:
-        if s.get("aggregation") or s.get("expression"):
-            metric_alias = s.get("alias")
+        if isinstance(s, dict) and (s.get("aggregation") or s.get("expression")):
+            metric_alias = s.get("alias") or s.get("column") or "value"
             break
-    if not metric_alias and selects:
-        metric_alias = selects[0].get("alias")
+    if not metric_alias and selects and isinstance(selects[0], dict):
+        metric_alias = selects[0].get("alias") or selects[0].get("column") or "value"
 
-    # GROUP BY dimension
-    if dim_col and dim_col not in group_by:
-        group_by.insert(0, dim_col)
-        selects.insert(0, {"column": dim_col, "expression": None, "aggregation": None, "alias": dim_col})
+    # ensure dimension in group_by and select
+    if dim_col:
+        # prefer exact case from schema
+        if schema:
+            for col in schema.keys():
+                if col.lower() == dim_col.lower():
+                    dim_col = col
+                    break
+        if dim_col not in group_by:
+            group_by.insert(0, dim_col)
+        dim_present = any(isinstance(s, dict) and (s.get("column") == dim_col or s.get("alias") == dim_col) for s in selects)
+        if not dim_present:
+            selects.insert(0, {"column": dim_col, "expression": None, "aggregation": None, "alias": dim_col})
 
-    # TOP
+    # apply top limit
     if top_n and not limit:
         plan["limit"] = top_n
 
-    # ORDER BY
+    # ordering semantics
     if metric_alias:
         if direction:
-            order_by = [{"column": metric_alias, "direction": direction}]
+            order_by = [o for o in order_by if not (isinstance(o, dict) and o.get("column") == metric_alias)]
+            order_by.insert(0, {"column": metric_alias, "direction": direction})
         elif dim_col and not order_by:
             order_by = [{"column": metric_alias, "direction": "DESC"}]
 
@@ -521,4 +597,6 @@ def extract_query(question: str):
     plan["group_by"] = group_by
     plan["order_by"] = order_by
 
-    return normalize_plan(plan)
+    # final normalization to ensure consistent shapes
+    plan = normalize_plan(plan)
+    return plan
