@@ -30,7 +30,7 @@
   },
 
   "total_volume": {
-    "expression": "SUM([ActualVolume])",
+    "expression": "SUM([ActualChargeable])",
     "aggregation": null,
     "synonyms": ["volume", "total volume", "sum volume"]
   },
