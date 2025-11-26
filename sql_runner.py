@@ -7,26 +7,32 @@ from dotenv import load_dotenv
 load_dotenv()
 
 def run_sql(sql, params=None):
-    """
-    Execute SQL safely and return rows as list of dicts.
-    Uses pandas.read_sql with params for parameterized query.
-    """
     conn = pyodbc.connect(
         f"DRIVER={{ODBC Driver 18 for SQL Server}};"
         f"SERVER={os.getenv('SQL_SERVER')};"
         f"DATABASE={os.getenv('SQL_DATABASE')};"
         f"UID={os.getenv('SQL_USERNAME')};"
         f"PWD={os.getenv('SQL_PASSWORD')};"
-        f"Encrypt=no;TrustServerCertificate=yes;"
+        "Encrypt=no;TrustServerCertificate=yes;"
     )
 
-    # pandas expects params sequence/tuple for pyodbc
+    # 🔥 FIX: CLEAN PARAMS BEFORE EXECUTION
+    clean_params = []
+    if params:
+        for p in params:
+            if p is None:
+                clean_params.append(None)
+            elif isinstance(p, str):
+                clean_params.append(p.strip().upper())   # normalize to uppercase
+            else:
+                clean_params.append(p)
+
     try:
-        df = pd.read_sql(sql, conn, params=params)
+        df = pd.read_sql(sql, conn, params=clean_params)
     finally:
         conn.close()
 
-    # If DataFrame empty, return []
     if df is None or df.empty:
         return []
     return df.to_dict(orient="records")
+
