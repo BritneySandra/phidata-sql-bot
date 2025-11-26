@@ -6,33 +6,41 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-def run_sql_query(sql, params=None):
-    import pyodbc
-
-    conn = pyodbc.connect(
-        f"DRIVER={{ODBC Driver 18 for SQL Server}};"
-        f"SERVER={os.getenv('SQL_SERVER')};"
-        f"DATABASE={os.getenv('SQL_DATABASE')};"
-        f"UID={os.getenv('SQL_USERNAME')};"
-        f"PWD={os.getenv('SQL_PASSWORD')};"
-        f"Encrypt=no;TrustServerCertificate=yes;",
-        timeout=10,
-    )
-    cur = conn.cursor()
-
+def run_sql(sql, params=None):
+    """
+    Executes a SQL query and returns (columns, rows)
+    Returns (None, error_message) when SQL fails.
+    """
+    conn = None
     try:
+        conn = pyodbc.connect(
+            f"DRIVER={{ODBC Driver 18 for SQL Server}};"
+            f"SERVER={os.getenv('SQL_SERVER')};"
+            f"DATABASE={os.getenv('SQL_DATABASE')};"
+            f"UID={os.getenv('SQL_USERNAME')};"
+            f"PWD={os.getenv('SQL_PASSWORD')};"
+            f"Encrypt=no;TrustServerCertificate=yes;",
+            timeout=10,
+        )
+
+        cur = conn.cursor()
+
+        # Execute with parameters
         if params:
             cur.execute(sql, params)
         else:
             cur.execute(sql)
 
         rows = cur.fetchall()
-        cols = [c[0] for c in cur.description]
-        conn.close()
+
+        # Extract column names
+        cols = [column[0] for column in cur.description]
 
         return cols, rows
 
     except Exception as e:
-        conn.close()
         return None, str(e)
 
+    finally:
+        if conn:
+            conn.close()
