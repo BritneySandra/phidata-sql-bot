@@ -1,4 +1,4 @@
-# sql_runner.py - execute SQL and return rows
+# sql_runner.py
 import pyodbc
 import pandas as pd
 import os
@@ -16,23 +16,19 @@ def run_sql(sql, params=None):
         "Encrypt=no;TrustServerCertificate=yes;"
     )
 
-    # 🔥 FIX: CLEAN PARAMS BEFORE EXECUTION
-    clean_params = []
+    cleaned = []
     if params:
         for p in params:
-            if p is None:
-                clean_params.append(None)
-            elif isinstance(p, str):
-                clean_params.append(p.strip().upper())   # normalize to uppercase
+            if isinstance(p, str):
+                cleaned.append(p.strip())
             else:
-                clean_params.append(p)
+                cleaned.append(p)
 
     try:
-        df = pd.read_sql(sql, conn, params=clean_params)
+        df = pd.read_sql(sql, conn, params=cleaned)
     finally:
         conn.close()
 
-    if df is None or df.empty:
+    if df.empty:
         return []
     return df.to_dict(orient="records")
-
