@@ -1,4 +1,4 @@
-# sql_builder.py - safe SQL builder
+# sql_builder.py - safe SQL builder (enhanced ordering, alias handling, dimension support)
 import re
 
 AGG_RE = re.compile(r"^\s*(sum|avg|count|min|max)\s*\(", re.IGNORECASE)
@@ -6,7 +6,8 @@ AGG_RE = re.compile(r"^\s*(sum|avg|count|min|max)\s*\(", re.IGNORECASE)
 def is_aggregate_expression(expr: str) -> bool:
     if not expr or not isinstance(expr, str):
         return False
-    return AGG_RE.match(expr.strip()) is not None
+    return bool(AGG_RE.match(expr.strip()))
+
 
 def build_sql_from_plan(plan, table, schema):
     """
@@ -24,111 +25,173 @@ def build_sql_from_plan(plan, table, schema):
 
     sql_select_parts = []
     metric_alias = None
-
     seen_cols = set()
-    for col in group_by:
-        if col in schema and col not in seen_cols:
-            sql_select_parts.append(f"[{col}]")
-            seen_cols.add(col)
 
+    # -------------------------------------------------------------
+    # 1. Ensure group-by columns appear in SELECT
+    # -------------------------------------------------------------
+    for col in group_by:
+        if col in schema:
+            if col not in seen_cols:
+                sql_select_parts.append(f"[{col}] AS [{col}]")
+                seen_cols.add(col)
+
+    # -------------------------------------------------------------
+    # 2. Build SELECT expressions
+    # -------------------------------------------------------------
     for sel in selects:
         if not isinstance(sel, dict):
             continue
+
         col = sel.get("column")
         expr = sel.get("expression")
         agg = sel.get("aggregation")
-        alias = sel.get("alias") or (col if col else "value")
+        alias = sel.get("alias") or col or "value"
 
-        if agg is not None and (str(agg).lower() in ("none","null")):
+        if agg and str(agg).lower() in ("none", "null"):
             agg = None
 
-        if agg:
+        # Remember metric alias for ORDER BY
+        if agg or (expr and is_aggregate_expression(expr)):
             metric_alias = alias
 
-        # expression provided
+        # -------------------------
+        # Case 1: Expression present
+        # -------------------------
         if expr and isinstance(expr, str) and expr.strip():
-            if is_aggregate_expression(expr):
-                sql_select_parts.append(f"{expr} AS [{alias}]")
+            expr_clean = expr.strip()
+
+            # Expression already contains an aggregate e.g. SUM(), AVG(), COUNT()
+            if is_aggregate_expression(expr_clean):
+                sql_select_parts.append(f"{expr_clean} AS [{alias}]")
             else:
+                # Wrap expression
                 if agg:
-                    sql_select_parts.append(f"{agg}({expr}) AS [{alias}]")
+                    sql_select_parts.append(f"{agg}({expr_clean}) AS [{alias}]")
                 else:
-                    sql_select_parts.append(f"{expr} AS [{alias}]")
+                    sql_select_parts.append(f"{expr_clean} AS [{alias}]")
             continue
 
-        # column provided
+        # -------------------------
+        # Case 2: Column present
+        # -------------------------
         if col:
-            if col in seen_cols:
-                continue
-            if agg:
-                sql_select_parts.append(f"{agg}([{col}]) AS [{alias}]")
-            else:
-                sql_select_parts.append(f"[{col}] AS [{alias}]")
-            seen_cols.add(col)
+            if col not in seen_cols:
+                if agg:
+                    sql_select_parts.append(f"{agg}([{col}]) AS [{alias}]")
+                else:
+                    sql_select_parts.append(f"[{col}] AS [{alias}]")
+                seen_cols.add(col)
             continue
 
+    # -------------------------------------------------------------
+    # Safety: no SELECT columns → fail
+    # -------------------------------------------------------------
     if not sql_select_parts:
         raise Exception("No valid SELECT expressions in plan")
 
+    # -------------------------------------------------------------
+    # Base query
+    # -------------------------------------------------------------
     sql = f"SELECT {', '.join(sql_select_parts)} FROM {table}"
 
+    # -------------------------------------------------------------
+    # WHERE
+    # -------------------------------------------------------------
     where_clauses = []
     params = []
+
     for flt in filters:
         if not isinstance(flt, dict):
             continue
+
         col = flt.get("column")
-        op = flt.get("operator", "=") or "="
+        op = flt.get("operator", "=")
         val = flt.get("value")
+
         if col and col in schema:
             where_clauses.append(f"[{col}] {op} ?")
             params.append(val)
+
     if where_clauses:
         sql += " WHERE " + " AND ".join(where_clauses)
 
+    # -------------------------------------------------------------
+    # GROUP BY
+    # -------------------------------------------------------------
     if group_by:
-        # ensure group_by includes only valid schema columns
         gb_valid = [c for c in group_by if c in schema]
         if gb_valid:
             sql += " GROUP BY " + ", ".join(f"[{c}]" for c in gb_valid)
 
-    # ORDER BY
+    # -------------------------------------------------------------
+    # ORDER BY — improved alias handling
+    # -------------------------------------------------------------
     if order_by:
         ob_parts = []
+
         for ob in order_by:
             if not isinstance(ob, dict):
                 continue
+
             col = ob.get("column")
             direction = ob.get("direction", "DESC")
-            if col:
+
+            if not col:
+                continue
+
+            # If alias exists, use alias
+            alias_list = [s.get("alias") for s in selects if isinstance(s, dict)]
+            if col in alias_list:
                 ob_parts.append(f"[{col}] {direction}")
+            else:
+                # Otherwise fallback to raw column
+                if col in schema:
+                    ob_parts.append(f"[{col}] {direction}")
+                else:
+                    # As last resort treat as alias
+                    ob_parts.append(f"[{col}] {direction}")
+
         if ob_parts:
             sql += " ORDER BY " + ", ".join(ob_parts)
+
+    # -------------------------------------------------------------
+    # Fallback ordering when LIMIT is used and no ORDER BY
+    # -------------------------------------------------------------
     elif limit and metric_alias:
         sql += f" ORDER BY [{metric_alias}] DESC"
 
-    # LIMIT (SQL Server uses TOP)
+    # -------------------------------------------------------------
+    # LIMIT / TOP
+    # -------------------------------------------------------------
     if limit:
         try:
             n = int(limit)
-            sql = f"SELECT TOP {n} " + sql[len("SELECT "):]
-        except Exception:
-            # ignore invalid limit
+            sql = "SELECT TOP " + str(n) + " " + sql[len("SELECT "):]
+        except:
             pass
 
-    # build output columns order for UI
+    # -------------------------------------------------------------
+    # Output column order for UI
+    # -------------------------------------------------------------
     columns = []
+
+    # group-by columns first
     for c in group_by:
         columns.append(c)
+
+    # then metric/dimension aliases
     for s in selects:
         if isinstance(s, dict):
-            a = s.get("alias")
-            if a:
-                columns.append(a)
+            if s.get("alias"):
+                columns.append(s["alias"])
+
+    # remove duplicates
     seen = set()
     cols_ordered = []
     for c in columns:
         if c not in seen:
             seen.add(c)
             cols_ordered.append(c)
+
     return sql, params, cols_ordered
