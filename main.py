@@ -122,16 +122,62 @@ async def ask(q: Query):
             return {"sql": sql, "result": "No data found", "rows": [], "columns": columns}
 
         # -----------------------------------------------------
-        # ✅ FIX: Normalize row keys to EXACT SQL column names
+        # Normalize row keys (keep exactly same functionality)
         # -----------------------------------------------------
         normalized_rows = []
         for row in rows:
             new_row = {}
             for col in columns:
-                # PyODBC returns lowercase keys; enforce correct SQL alias
                 new_row[col] = row.get(col) or row.get(col.lower()) or row.get(col.upper())
             normalized_rows.append(new_row)
         rows = normalized_rows
+        # -----------------------------------------------------
+
+        # -----------------------------------------------------
+        # 🔥 YOY DIFFERENCE + GROWTH % CALCULATION (NEW BLOCK)
+        # -----------------------------------------------------
+        q_low = q.question.lower()
+
+        if ("previous year" in q_low or 
+            "last year" in q_low or 
+            "growth" in q_low or 
+            "difference" in q_low or 
+            "yoy" in q_low):
+
+            # Expecting rows like:
+            # [{"FinancialYear":2024,"revenue":1000000}, {"FinancialYear":2023,"revenue":850000}]
+            if len(rows) >= 2 and ("FinancialYear" in rows[0]):
+
+                # Sort by year
+                rows_sorted = sorted(rows, key=lambda x: x["FinancialYear"])
+                y1, y2 = rows_sorted[-2], rows_sorted[-1]
+
+                metric_col = None
+                for c in rows[0].keys():
+                    if c.lower() not in ["financialyear", "year"]:
+                        metric_col = c
+                        break
+
+                if metric_col:
+                    v1 = float(y1[metric_col] or 0)
+                    v2 = float(y2[metric_col] or 0)
+
+                    diff = v2 - v1
+                    growth = (diff / v1 * 100.0) if v1 != 0 else 0
+
+                    yoy_summary = (
+                        f"FY{y2['FinancialYear']} {metric_col}: {v2:,.2f}\n"
+                        f"FY{y1['FinancialYear']} {metric_col}: {v1:,.2f}\n"
+                        f"Difference: {diff:,.2f}\n"
+                        f"Growth %: {growth:.2f}%"
+                    )
+
+                    return {
+                        "sql": sql,
+                        "result": yoy_summary,
+                        "rows": rows,
+                        "columns": columns
+                    }
         # -----------------------------------------------------
 
         # Single scalar → natural language
@@ -153,7 +199,6 @@ async def ask(q: Query):
             content={
                 "sql": locals().get("sql", None),
                 "result": f"SQL execution error: {e}",
-                "rows": [],
-                "columns": []
+                "rows": [], "columns": []
             }
         )
