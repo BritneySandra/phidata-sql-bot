@@ -1,5 +1,6 @@
 # agent.py — CLEAN + STRICT VALUE FILTERS + stable dimension/TOP/time logic
 # Updated with only ONE patch: FORCE METRIC DETECTED FROM QUESTION
+# + small TOP-N numeric detection patch (only when LLM didn't already set a limit)
 
 import os
 import json
@@ -530,6 +531,28 @@ def extract_query(question: str):
 
     dim_col = detect_dimension_from_text(question, schema)
     top_n, direction, has_top = extract_top_n_and_direction(question)
+
+    # --- NEW PATCH: detect explicit numeric N in natural expressions if model didn't set top_n ---
+    explicit_n = None
+    if not top_n:
+        # look for common "show/display/list X" patterns or "X customers" patterns
+        m = re.search(r"\b(?:show|display|list|give|return|top|first|last)\b[^\d]{0,20}?(\d+)\b", question.lower())
+        if not m:
+            m = re.search(r"\b(\d+)\s+(?:rows|results|customers|companies|entries|items|customers?)\b", question.lower())
+        if m:
+            try:
+                num = int(m.group(1))
+                if num > 0:
+                    explicit_n = num
+            except:
+                explicit_n = None
+
+    # apply explicit_n if found
+    if explicit_n and not top_n:
+        plan["limit"] = explicit_n
+        top_n = explicit_n
+
+    # --- end of numeric detection patch ---
 
     if dim_col:
         for col in schema.keys():
