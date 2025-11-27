@@ -72,20 +72,23 @@ async function ask() {
 
     let html = "<b>SQL:</b><br>" + (data.sql || "(none)") + "<br><br>";
 
-    if (data.rows && data.rows.length > 0 && data.columns) {
-        html += "<b>Result:</b><br>";
-        html += "<table class='result-table'><tr>";
-        data.columns.forEach(c => html += "<th>" + c + "</th>");
+   if (data.rows && data.rows.length > 0) {
+    html += "<b>Result:</b><br>";
+
+    let cols = Object.keys(data.rows[0]);
+
+    html += "<table class='result-table'><tr>";
+    cols.forEach(c => html += "<th>" + c + "</th>");
+    html += "</tr>";
+
+    data.rows.forEach(r => {
+        html += "<tr>";
+        cols.forEach(c => html += "<td>" + (r[c] ?? '') + "</td>");
         html += "</tr>";
+    });
 
-        data.rows.forEach(r => {
-            html += "<tr>";
-            data.columns.forEach(c => html += "<td>" + (r[c] ?? '') + "</td>");
-            html += "</tr>";
-        });
-
-        html += "</table>";
-    } else {
+    html += "</table>";
+} else {
         html += "<b>Answer:</b><br>" + (data.result || "No data");
     }
     document.getElementById("a").innerHTML = html;
