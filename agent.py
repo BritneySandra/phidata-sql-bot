@@ -1,5 +1,5 @@
 # agent.py — CLEAN + STRICT VALUE FILTERS + stable dimension/TOP/time logic
-# Updated to coerce plan shapes to avoid "'str' object has no attribute 'get'"
+# Updated with only ONE patch: FORCE METRIC DETECTED FROM QUESTION
 
 import os
 import json
@@ -44,27 +44,20 @@ DIMENSION_MAP = {
     "customerleadgroup": "CustomerLeadGroup",
     "customer lead group": "CustomerLeadGroup",
     "customer group": "CustomerLeadGroup",
-
     "branch": "BranchCode",
     "office": "BranchCode",
     "location": "BranchCode",
-
     "company": "CompanyCode",
     "org": "CompanyCode",
-
     "department": "DeptCode",
     "dept": "DeptCode",
     "team": "DeptCode",
-
     "job level": "JobLevel1",
     "joblevel1": "JobLevel1",
-
     "product": "ProductLevel1",
     "productlevel1": "ProductLevel1",
-
     "job type": "JobType",
     "jobtype": "JobType",
-
     "job status": "JobStatus",
     "jobstatus": "JobStatus",
 }
@@ -226,40 +219,30 @@ def parse_time_filters(text: str):
 
 
 ############################################################
-# STRICT VALUE FILTER PARSER (NEW, FIXED)
+# STRICT VALUE FILTER PARSER
 ############################################################
 def extract_value_filters(question: str, schema: dict):
-    """
-    STRICT MODE:
-    Only extract values if the user explicitly mentions the COLUMN NAME.
-    Example:
-        "transport mode sea" -> TransportMode = 'sea'
-        "sea shipments" -> NO filter
-    """
     q = question.lower()
     filters = []
-
     if not schema:
         return filters
 
     for col in schema.keys():
         col_low = col.lower()
-        # require column token present
         if col_low not in q:
             continue
-        # capture next token after column mention as value (letters/numbers/-,_)
         m = re.search(rf"{re.escape(col_low)}\s*(?:is|=|:)?\s*([a-zA-Z0-9\-_]+)", q)
         if m:
-            val = m.group(1)
-            filters.append({"column": col, "operator": "=", "value": val})
+            filters.append({"column": col, "operator": "=", "value": m.group(1)})
+
     return filters
 
 
 ############################################################
 # METRIC + DIM DETECT
 ############################################################
-DESC_KEYWORDS = {"top", "highest", "greater", "max", "most", "biggest","maximum"}
-ASC_KEYWORDS = {"least", "lowest", "min", "smallest", "bottom","minimum"}
+DESC_KEYWORDS = {"top", "highest", "greater", "max", "most", "biggest", "maximum"}
+ASC_KEYWORDS = {"least", "lowest", "min", "smallest", "bottom", "minimum"}
 
 def extract_top_n_and_direction(text: str):
     t = (text or "").lower()
@@ -302,7 +285,7 @@ def detect_metric_from_text(text: str):
 
 
 ############################################################
-# BUILD PLAN FOR FALLBACK METRIC
+# FALLBACK METRIC PLAN
 ############################################################
 def build_plan_from_metric(metric_key, question_text):
     m = METRICS.get(metric_key)
@@ -320,14 +303,12 @@ def build_plan_from_metric(metric_key, question_text):
 
     plan = {"select": [sel], "filters": [], "group_by": [], "order_by": [], "limit": None}
     tfs = parse_time_filters(question_text)
-    for t in tfs:
-        t["value"] = t.get("value")
     plan["filters"].extend(tfs)
     return plan
 
 
 ############################################################
-# PROMPT BUILD
+# LLM PROMPT
 ############################################################
 def build_prompt(question, schema, metadata, metrics):
     rules = (
@@ -346,7 +327,7 @@ def build_prompt(question, schema, metadata, metrics):
 
 
 ############################################################
-# PARSE MODEL JSON OUTPUT
+# CALL MODEL
 ############################################################
 def call_model_and_get_plan(client, model, prompt):
     resp = client.chat.completions.create(
@@ -363,10 +344,7 @@ def call_model_and_get_plan(client, model, prompt):
     try:
         return json.loads(txt)
     except:
-        try:
-            return json.loads(txt.replace("'", '"'))
-        except:
-            raise ValueError("Invalid JSON returned")
+        return json.loads(txt.replace("'", '"'))
 
 
 ############################################################
@@ -386,7 +364,6 @@ def normalize_plan(plan):
 
     schema = get_schema() or {}
 
-    # clean group_by
     gb_clean = []
     for g in group_by:
         if isinstance(g, str) and (not schema or g in schema):
@@ -394,7 +371,7 @@ def normalize_plan(plan):
 
     clean_selects = []
     seen_alias = set()
-    # ensure group_by columns are first in select
+
     for g in gb_clean:
         clean_selects.append({"column": g, "expression": None, "aggregation": None, "alias": g})
         seen_alias.add(g)
@@ -406,8 +383,10 @@ def normalize_plan(plan):
         expr = s.get("expression")
         agg = s.get("aggregation")
         alias = s.get("alias") or col or "value"
+
         if is_aggregate_expression(expr):
             agg = None
+
         if alias not in seen_alias:
             clean_selects.append({"column": col, "expression": expr, "aggregation": agg, "alias": alias})
             seen_alias.add(alias)
@@ -431,61 +410,36 @@ def normalize_plan(plan):
 
 
 ############################################################
-# HELP: coerce plan shape (pre-normalization) to avoid string.get errors
+# COERCE PLAN SHAPES
 ############################################################
 def coerce_plan_shapes(plan):
-    """
-    Ensure plan['select'] is list of dicts (if items are strings -> convert to {'alias':str})
-    Ensure plan['filters'] is list of dicts
-    Ensure plan['order_by'] is list of dicts
-    Ensure plan['group_by'] is list of strings
-    """
     if not isinstance(plan, dict):
         return plan
 
-    # selects
     s = plan.get("select", [])
-    if s is None:
-        s = []
+    if s is None: s = []
     coerced_selects = []
     for item in s:
         if isinstance(item, dict):
             coerced_selects.append(item)
         elif isinstance(item, str):
             coerced_selects.append({"column": None, "expression": None, "aggregation": None, "alias": item})
-        else:
-            # unknown type -> skip
-            continue
     plan["select"] = coerced_selects
 
-    # filters
     f = plan.get("filters", [])
-    if f is None:
-        f = []
-    coerced_filters = []
-    for item in f:
-        if isinstance(item, dict):
-            coerced_filters.append(item)
-        else:
-            # skip non-dicts
-            continue
-    plan["filters"] = coerced_filters
+    if f is None: f = []
+    plan["filters"] = [x for x in f if isinstance(x, dict)]
 
-    # order_by
     ob = plan.get("order_by", [])
-    if ob is None:
-        ob = []
+    if ob is None: ob = []
     coerced_ob = []
     for item in ob:
         if isinstance(item, dict):
             coerced_ob.append(item)
         elif isinstance(item, str):
             coerced_ob.append({"column": item, "direction": "DESC"})
-        else:
-            continue
     plan["order_by"] = coerced_ob
 
-    # group_by
     gb = plan.get("group_by", []) or []
     coerced_gb = []
     for item in gb:
@@ -507,7 +461,6 @@ def extract_query(question: str):
     schema = get_schema()
     client = get_client()
 
-    # --- 1) Build prompt & try LLM ---
     prompt = build_prompt(question, schema, METADATA, METRICS)
     model = choose_best_groq_model(client) if client else None
 
@@ -518,7 +471,6 @@ def extract_query(question: str):
         except:
             plan = None
 
-    # --- 2) If model fails, fallback to metric-based plan ---
     if not plan:
         metric = detect_metric_from_text(question)
         if metric:
@@ -526,10 +478,8 @@ def extract_query(question: str):
         else:
             return {"error": "Cannot interpret question (no model output and no metric detected)"}
 
-    # --- 3) Coerce shapes BEFORE any logic ---
     plan = coerce_plan_shapes(plan or {})
 
-    # --- 4) Apply TIME FILTERS & STRICT VALUE FILTERS ---
     time_filters = parse_time_filters(question)
     value_filters = extract_value_filters(question, schema)
 
@@ -540,7 +490,6 @@ def extract_query(question: str):
         if isinstance(f, dict) and f.get("column") not in time_cols:
             merged_filters.append(f)
 
-    # strict filters
     existing_cols = {f.get("column") for f in merged_filters}
     for vf in value_filters:
         if vf.get("column") not in existing_cols:
@@ -548,15 +497,14 @@ def extract_query(question: str):
 
     plan["filters"] = merged_filters
 
-    # --- 5) Extract raw structures ---
     selects = plan.get("select", []) or []
     group_by = plan.get("group_by", []) or []
     order_by = plan.get("order_by", []) or []
     limit = plan.get("limit")
 
-    # ----------------------------------------------------------
-    # 🔥 6) FORCE METRIC DETECTED FROM QUESTION (NEW FIX)
-    # ----------------------------------------------------------
+    #########################################################
+    # 🔥 PATCH ADDED HERE — force metric detected from question
+    #########################################################
     metric_key = detect_metric_from_text(question)
     if metric_key and metric_key in METRICS:
         metric_info = METRICS[metric_key]
@@ -565,7 +513,7 @@ def extract_query(question: str):
         alias = metric_key
 
         already = any(
-            isinstance(s, dict) and (s.get("alias") == alias)
+            isinstance(s, dict) and s.get("alias") == alias
             for s in selects
         )
 
@@ -576,15 +524,13 @@ def extract_query(question: str):
                 "aggregation": agg,
                 "alias": alias
             })
+    #########################################################
 
-    # --- Update plan ---
     plan["select"] = selects
 
-    # --- 7) Detect dimension & TOP-N ---
     dim_col = detect_dimension_from_text(question, schema)
     top_n, direction, has_top = extract_top_n_and_direction(question)
 
-    # --- 8) Dimension → add to SELECT & GROUP BY ---
     if dim_col:
         for col in schema.keys():
             if col.lower() == dim_col.lower():
@@ -606,11 +552,9 @@ def extract_query(question: str):
                 "alias": dim_col
             })
 
-    # --- 9) TOP N ---
     if top_n:
         plan["limit"] = top_n
 
-    # --- 10) Ordering logic ---
     metric_alias = None
     for s in selects:
         if isinstance(s, dict) and (s.get("aggregation") or s.get("expression")):
@@ -627,12 +571,8 @@ def extract_query(question: str):
     plan["group_by"] = group_by
     plan["order_by"] = order_by
 
-    # --- 11) Normalize plan ---
     plan = normalize_plan(plan)
 
-    # ----------------------------------------------------------
-    # 12) FINAL SAFETY: Ensure SELECT is NEVER empty
-    # ----------------------------------------------------------
     valid = []
     for s in plan.get("select", []):
         if isinstance(s, dict):
@@ -642,11 +582,9 @@ def extract_query(question: str):
                 valid.append(s)
 
     if not valid:
-        # fallback metric again
         metric = detect_metric_from_text(question)
         if metric:
             return build_plan_from_metric(metric, question)
         return {"error": "No valid SELECT expressions even after metric injection"}
 
     return plan
-
