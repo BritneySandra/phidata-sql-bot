@@ -21,13 +21,16 @@ app.add_middleware(
 
 TABLE = "WBI_BI_Data_V2"
 
+
 @app.get("/")
 async def root():
     return {"status": "ok", "message": "API running"}
 
+
 @app.get("/health")
 async def health():
     return {"status": "healthy"}
+
 
 @app.get("/chat", response_class=HTMLResponse)
 async def chat_ui():
@@ -66,17 +69,21 @@ async function ask() {
         body: JSON.stringify({question: q})
     });
     let data = await res.json();
+
     let html = "<b>SQL:</b><br>" + (data.sql || "(none)") + "<br><br>";
+
     if (data.rows && data.rows.length > 0 && data.columns) {
         html += "<b>Result:</b><br>";
         html += "<table class='result-table'><tr>";
         data.columns.forEach(c => html += "<th>" + c + "</th>");
         html += "</tr>";
+
         data.rows.forEach(r => {
             html += "<tr>";
             data.columns.forEach(c => html += "<td>" + (r[c] ?? '') + "</td>");
             html += "</tr>";
         });
+
         html += "</table>";
     } else {
         html += "<b>Answer:</b><br>" + (data.result || "No data");
@@ -88,38 +95,49 @@ async function ask() {
 </html>
     """
 
+
 class Query(BaseModel):
     question: str
+
 
 @app.post("/ask")
 async def ask(q: Query):
     schema = get_schema()
+
     try:
         plan = extract_query(q.question)
 
-        # If AI returned error, forward it
+        # If AI returned error
         if isinstance(plan, dict) and plan.get("error"):
-            return {"sql": None, "result": f"AI returned incomplete plan: {plan.get('error')}", "rows": [], "columns": []}
+            return {"sql": None, "result": f"AI error: {plan.get('error')}", "rows": [], "columns": []}
 
         sql, params, columns = build_sql_from_plan(plan, TABLE, schema)
-
         rows = run_sql(sql, params)
 
+        # No rows
         if not rows:
             return {"sql": sql, "result": "No data found", "rows": [], "columns": columns}
 
-        # If scalar single-row single-col, return human-friendly sentence
+        # -----------------------------------------------------
+        # ✅ FIX: Normalize row keys to EXACT SQL column names
+        # -----------------------------------------------------
+        normalized_rows = []
+        for row in rows:
+            new_row = {}
+            for col in columns:
+                # PyODBC returns lowercase keys; enforce correct SQL alias
+                new_row[col] = row.get(col) or row.get(col.lower()) or row.get(col.upper())
+            normalized_rows.append(new_row)
+        rows = normalized_rows
+        # -----------------------------------------------------
+
+        # Single scalar → natural language
         if len(rows) == 1 and len(columns) == 1:
             val = rows[0].get(columns[0])
-            try:
-                # numeric formatting with commas (if numeric)
-                if isinstance(val, (int, float)):
-                    val_fmt = f"{val:,.2f}" if isinstance(val, float) else f"{val:,}"
-                else:
-                    val_fmt = str(val)
-            except Exception:
+            if isinstance(val, (int, float)):
+                val_fmt = f"{val:,.2f}" if isinstance(val, float) else f"{val:,}"
+            else:
                 val_fmt = str(val)
-            # produce a natural language response
             summary = f"The {columns[0].replace('_',' ')} is {val_fmt}."
         else:
             summary = f"{len(rows)} rows returned."
