@@ -161,12 +161,11 @@ def build_sql_from_plan(plan, table, schema):
     # LIMIT / TOP
     # -------------------------------------------------------------
     if limit:
-        try:
-            n = int(limit)
-            sql = "SELECT TOP " + str(n) + " " + sql[len("SELECT "):]
-        except:
-            pass
-
+    try:
+        n = int(limit)
+        sql = sql.replace("SELECT ", f"SELECT TOP {n} ", 1)
+    except:
+        pass
     # -------------------------------------------------------------
     # Output column order for UI
     # -------------------------------------------------------------
