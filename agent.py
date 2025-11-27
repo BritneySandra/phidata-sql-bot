@@ -258,8 +258,8 @@ def extract_value_filters(question: str, schema: dict):
 ############################################################
 # METRIC + DIM DETECT
 ############################################################
-DESC_KEYWORDS = {"top", "highest", "greater", "max", "most", "biggest"}
-ASC_KEYWORDS = {"least", "lowest", "min", "smallest", "bottom"}
+DESC_KEYWORDS = {"top", "highest", "greater", "max", "most", "biggest","maximum"}
+ASC_KEYWORDS = {"least", "lowest", "min", "smallest", "bottom","minimum"}
 
 def extract_top_n_and_direction(text: str):
     t = (text or "").lower()
