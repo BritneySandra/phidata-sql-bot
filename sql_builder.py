@@ -8,7 +8,6 @@ def is_aggregate_expression(expr: str) -> bool:
         return False
     return bool(AGG_RE.match(expr.strip()))
 
-
 def build_sql_from_plan(plan, table, schema):
     """
     Returns: sql, params, columns_ordered
@@ -61,9 +60,11 @@ def build_sql_from_plan(plan, table, schema):
         if expr and isinstance(expr, str) and expr.strip():
             expr_clean = expr.strip()
 
+            # Expression already contains an aggregate e.g. SUM(), AVG(), COUNT()
             if is_aggregate_expression(expr_clean):
                 sql_select_parts.append(f"{expr_clean} AS [{alias}]")
             else:
+                # Wrap expression
                 if agg:
                     sql_select_parts.append(f"{agg}({expr_clean}) AS [{alias}]")
                 else:
@@ -104,10 +105,22 @@ def build_sql_from_plan(plan, table, schema):
             continue
 
         col = flt.get("column")
-        op = flt.get("operator", "=")
+        op = (flt.get("operator") or "=").lower()
         val = flt.get("value")
 
-        if col and col in schema:
+        if not col or col not in schema:
+            # skip unknown columns
+            continue
+
+        if op == "in" and isinstance(val, (list, tuple)):
+            placeholders = ", ".join("?" for _ in val)
+            where_clauses.append(f"[{col}] IN ({placeholders})")
+            params.extend(val)
+        else:
+            # default equality / other operator applied as-is
+            # Sanitize operator to common allowed ones
+            if op not in ("=", ">", "<", "<=", ">=", "<>", "!=", "like"):
+                op = "="
             where_clauses.append(f"[{col}] {op} ?")
             params.append(val)
 
@@ -138,20 +151,25 @@ def build_sql_from_plan(plan, table, schema):
             if not col:
                 continue
 
+            # If alias exists, use alias
             alias_list = [s.get("alias") for s in selects if isinstance(s, dict)]
-
             if col in alias_list:
                 ob_parts.append(f"[{col}] {direction}")
-            elif col in schema:
-                ob_parts.append(f"[{col}] {direction}")
             else:
-                ob_parts.append(f"[{col}] {direction}")
+                # Otherwise fallback to raw column
+                if col in schema:
+                    ob_parts.append(f"[{col}] {direction}")
+                else:
+                    # As last resort treat as alias
+                    ob_parts.append(f"[{col}] {direction}")
 
         if ob_parts:
             sql += " ORDER BY " + ", ".join(ob_parts)
 
     # -------------------------------------------------------------
-    # LIMIT / TOP — ✔ FIXED INDENTATION
+    # Fallback ordering when LIMIT is used and no ORDER BY
+    # -------------------------------------------------------------
+    # LIMIT / TOP
     # -------------------------------------------------------------
     if limit:
         try:
@@ -165,13 +183,17 @@ def build_sql_from_plan(plan, table, schema):
     # -------------------------------------------------------------
     columns = []
 
+    # group-by columns first
     for c in group_by:
         columns.append(c)
 
+    # then metric/dimension aliases
     for s in selects:
-        if isinstance(s, dict) and s.get("alias"):
-            columns.append(s["alias"])
+        if isinstance(s, dict):
+            if s.get("alias"):
+                columns.append(s["alias"])
 
+    # remove duplicates
     seen = set()
     cols_ordered = []
     for c in columns:
