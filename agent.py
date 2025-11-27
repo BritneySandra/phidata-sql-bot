@@ -2,6 +2,8 @@
 # Updated with:
 # 1) FORCE METRIC DETECTED FROM QUESTION
 # 2) Numeric-limit patch inserted IMMEDIATELY AFTER extract_top_n_and_direction()
+# 3) YOY detection: when user asks to compare two years (or previous/this), force FinancialYear IN (...) and group_by FinancialYear
+# Minimal, focused changes only — rest of your working logic preserved.
 
 import os
 import json
@@ -142,16 +144,16 @@ def choose_best_groq_model(client):
 ############################################################
 # TIME UTILS
 ############################################################
-def calendar_to_fy_year(y, m): return y if m >= 3 else y-1
-def calendar_to_fy_month(m): return ((m-3) % 12) + 1
+def calendar_to_fy_year(y, m): return y if m >= 3 else y - 1
+def calendar_to_fy_month(m): return ((m - 3) % 12) + 1
 def current_utc(): return datetime.utcnow()
 
 def last_financial_quarter(ref=None):
     if not ref: ref = current_utc()
     fy = calendar_to_fy_year(ref.year, ref.month)
     fm = calendar_to_fy_month(ref.month)
-    fq = ceil(fm/3)
-    return ((fy-1,4) if fq==1 else (fy,fq-1))
+    fq = ceil(fm / 3)
+    return ((fy - 1, 4) if fq == 1 else (fy, fq - 1))
 
 def previous_calendar_month(ref=None):
     if not ref: ref = current_utc()
@@ -171,46 +173,45 @@ def parse_time_filters(text: str):
 
     m = re.search(r"\b(?:fy|financial year)\s*(20\d{2})\b", q)
     if m:
-        return [{"column":"FinancialYear","operator":"=","value":int(m.group(1))}]
+        return [{"column": "FinancialYear", "operator": "=", "value": int(m.group(1))}]
 
     m = re.search(r"\b(?:q|quarter)\s*([1-4])(?:.*?(20\d{2}))?", q)
     if m:
         qn = int(m.group(1))
         yr = int(m.group(2)) if m.group(2) else None
-        out = [{"column":"FinancialQuarter","operator":"=","value":qn}]
-        if yr:
-            out.append({"column":"FinancialYear","operator":"=","value":yr})
+        out = [{"column": "FinancialQuarter", "operator": "=", "value": qn}]
+        if yr: out.append({"column": "FinancialYear", "operator": "=", "value": yr})
         return out
 
     m = re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(20\d{2})\b", q)
     if m:
-        month = datetime.strptime(m.group(1)[:3],"%b").month
+        month = datetime.strptime(m.group(1)[:3], "%b").month
         yr = int(m.group(2))
         return [
-            {"column":"FinancialMonth","operator":"=","value":calendar_to_fy_month(month)},
-            {"column":"FinancialYear","operator":"=","value":calendar_to_fy_year(yr,month)}
+            {"column": "FinancialMonth", "operator": "=", "value": calendar_to_fy_month(month)},
+            {"column": "FinancialYear", "operator": "=", "value": calendar_to_fy_year(yr, month)},
         ]
 
     if "previous month" in q or "last month" in q:
-        y,mth = previous_calendar_month()
+        y, mth = previous_calendar_month()
         return [
-            {"column":"FinancialMonth","operator":"=","value":calendar_to_fy_month(mth)},
-            {"column":"FinancialYear","operator":"=","value":calendar_to_fy_year(y,mth)}
+            {"column": "FinancialMonth", "operator": "=", "value": calendar_to_fy_month(mth)},
+            {"column": "FinancialYear", "operator": "=", "value": calendar_to_fy_year(y, mth)},
         ]
 
     if "previous quarter" in q or "last quarter" in q:
-        fy,fq = last_financial_quarter()
+        fy, fq = last_financial_quarter()
         return [
-            {"column":"FinancialQuarter","operator":"=","value":fq},
-            {"column":"FinancialYear","operator":"=","value":fy}
+            {"column": "FinancialQuarter", "operator": "=", "value": fq},
+            {"column": "FinancialYear", "operator": "=", "value": fy},
         ]
 
     if "previous year" in q or "last year" in q:
-        return [{"column":"FinancialYear","operator":"=","value":previous_calendar_year()}]
+        return [{"column": "FinancialYear", "operator": "=", "value": previous_calendar_year()}]
 
     m = re.search(r"\b(20\d{2})\b", q)
     if m:
-        return [{"column":"FinancialYear","operator":"=","value":int(m.group(1))}]
+        return [{"column": "FinancialYear", "operator": "=", "value": int(m.group(1))}]
 
     return []
 
@@ -228,18 +229,18 @@ def extract_value_filters(question: str, schema: dict):
         col_low = col.lower()
         if col_low not in q:
             continue
-        
+
         m = re.search(rf"{re.escape(col_low)}\s*(?:is|=|:)?\s*([a-zA-Z0-9\-_]+)", q)
         if m:
-            filters.append({"column":col,"operator":"=","value":m.group(1)})
+            filters.append({"column": col, "operator": "=", "value": m.group(1)})
 
     return filters
 
 ############################################################
 # METRIC + DIM DETECT
 ############################################################
-DESC_KEYWORDS = {"top","highest","greater","max","most","biggest","maximum"}
-ASC_KEYWORDS  = {"least","lowest","min","smallest","bottom","minimum"}
+DESC_KEYWORDS = {"top", "highest", "greater", "max", "most", "biggest", "maximum"}
+ASC_KEYWORDS = {"least", "lowest", "min", "smallest", "bottom", "minimum"}
 
 def extract_top_n_and_direction(text: str):
     t = (text or "").lower()
@@ -270,7 +271,7 @@ def detect_dimension_from_text(text: str, schema: dict):
             if col.lower() in t:
                 return col
 
-    for syn,col in DIM_LOOKUP.items():
+    for syn, col in DIM_LOOKUP.items():
         if syn in t:
             if not schema or col in schema:
                 return col
@@ -280,7 +281,7 @@ def detect_dimension_from_text(text: str, schema: dict):
 
 def detect_metric_from_text(text: str):
     t = (text or "").lower()
-    for syn,metric in SYNONYM_MAP.items():
+    for syn, metric in SYNONYM_MAP.items():
         if syn in t:
             return metric
     return None
@@ -297,12 +298,12 @@ def build_plan_from_metric(metric_key, question_text):
     agg  = m.get("aggregation")
     alias = metric_key
 
-    if isinstance(expr,str) and re.match(r"^\s*(sum|avg|min|max|count)\s*\(", expr.strip(), re.IGNORECASE):
-        sel = {"column":None, "expression":expr, "aggregation":None, "alias":alias}
+    if isinstance(expr, str) and re.match(r"^\s*(sum|avg|min|max|count)\s*\(", expr.strip(), re.IGNORECASE):
+        sel = {"column": None, "expression": expr, "aggregation": None, "alias": alias}
     else:
-        sel = {"column":None, "expression":expr, "aggregation":agg, "alias":alias}
+        sel = {"column": None, "expression": expr, "aggregation": agg, "alias": alias}
 
-    plan = {"select":[sel],"filters":[],"group_by":[],"order_by":[],"limit":None}
+    plan = {"select": [sel], "filters": [], "group_by": [], "order_by": [], "limit": None}
 
     tfs = parse_time_filters(question_text)
     plan["filters"].extend(tfs)
@@ -333,53 +334,53 @@ def build_prompt(question, schema, metadata, metrics):
 def call_model_and_get_plan(client, model, prompt):
     resp = client.chat.completions.create(
         model=model,
-        messages=[{"role":"user","content":prompt}],
+        messages=[{"role": "user", "content": prompt}],
         temperature=0
     )
     raw = resp.choices[0].message.content.strip()
 
     s = raw.find("{")
     e = raw.rfind("}")
-    if s==-1 or e==-1:
+    if s == -1 or e == -1:
         raise ValueError("No JSON returned")
 
     txt = raw[s:e+1]
     try:
         return json.loads(txt)
     except:
-        return json.loads(txt.replace("'",'"'))
+        return json.loads(txt.replace("'", '"'))
 
 ############################################################
 # NORMALIZE PLAN
 ############################################################
 AGG_RE = re.compile(r"^\s*(sum|avg|count|min|max)\s*\(", re.IGNORECASE)
 def is_aggregate_expression(expr):
-    return bool(expr and isinstance(expr,str) and AGG_RE.match(expr.strip()))
+    return bool(expr and isinstance(expr, str) and AGG_RE.match(expr.strip()))
 
 def normalize_plan(plan):
     plan = dict(plan or {})
-    selects  = plan.get("select",[]) or []
-    group_by = plan.get("group_by",[]) or []
-    order_by = plan.get("order_by",[]) or []
-    filters  = plan.get("filters",[]) or []
+    selects  = plan.get("select", []) or []
+    group_by = plan.get("group_by", []) or []
+    order_by = plan.get("order_by", []) or []
+    filters  = plan.get("filters", []) or []
     limit    = plan.get("limit")
 
     schema = get_schema() or {}
 
     gb_clean = []
     for g in group_by:
-        if isinstance(g,str) and (not schema or g in schema):
+        if isinstance(g, str) and (not schema or g in schema):
             gb_clean.append(g)
 
     clean_selects = []
     seen_alias = set()
 
     for g in gb_clean:
-        clean_selects.append({"column":g,"expression":None,"aggregation":None,"alias":g})
+        clean_selects.append({"column": g, "expression": None, "aggregation": None, "alias": g})
         seen_alias.add(g)
 
     for s in selects:
-        if not isinstance(s,dict):
+        if not isinstance(s, dict):
             continue
 
         col   = s.get("column")
@@ -391,24 +392,24 @@ def normalize_plan(plan):
             agg = None
 
         if alias not in seen_alias:
-            clean_selects.append({"column":col,"expression":expr,"aggregation":agg,"alias":alias})
+            clean_selects.append({"column": col, "expression": expr, "aggregation": agg, "alias": alias})
             seen_alias.add(alias)
 
     valid_aliases = {s["alias"] for s in clean_selects}
     clean_order = []
     for o in order_by:
-        if not isinstance(o,dict):
+        if not isinstance(o, dict):
             continue
 
         col = o.get("column")
-        direction = o.get("direction","DESC") or "DESC"
+        direction = o.get("direction", "DESC") or "DESC"
 
         if col in valid_aliases or col in gb_clean:
-            clean_order.append({"column":col,"direction":direction})
+            clean_order.append({"column": col, "direction": direction})
 
     plan["select"]  = clean_selects
-    plan["group_by"]= gb_clean
-    plan["order_by"]= clean_order
+    plan["group_by"] = gb_clean
+    plan["order_by"] = clean_order
     plan["filters"] = filters
     plan["limit"]   = limit
 
@@ -418,41 +419,41 @@ def normalize_plan(plan):
 # COERCE PLAN SHAPES
 ############################################################
 def coerce_plan_shapes(plan):
-    if not isinstance(plan,dict):
+    if not isinstance(plan, dict):
         return plan
 
-    s = plan.get("select",[])
+    s = plan.get("select", [])
     if s is None: s = []
     coerced_selects = []
     for item in s:
-        if isinstance(item,dict):
+        if isinstance(item, dict):
             coerced_selects.append(item)
-        elif isinstance(item,str):
-            coerced_selects.append({"column":None,"expression":None,"aggregation":None,"alias":item})
+        elif isinstance(item, str):
+            coerced_selects.append({"column": None, "expression": None, "aggregation": None, "alias": item})
     plan["select"] = coerced_selects
 
-    f = plan.get("filters",[])
+    f = plan.get("filters", [])
     if f is None: f = []
-    plan["filters"] = [x for x in f if isinstance(x,dict)]
+    plan["filters"] = [x for x in f if isinstance(x, dict)]
 
-    ob = plan.get("order_by",[])
+    ob = plan.get("order_by", [])
     if ob is None: ob = []
     coerced_ob = []
     for item in ob:
-        if isinstance(item,dict):
+        if isinstance(item, dict):
             coerced_ob.append(item)
-        elif isinstance(item,str):
-            coerced_ob.append({"column":item,"direction":"DESC"})
+        elif isinstance(item, str):
+            coerced_ob.append({"column": item, "direction": "DESC"})
     plan["order_by"] = coerced_ob
 
-    gb = plan.get("group_by",[]) or []
+    gb = plan.get("group_by", []) or []
     coerced_gb = []
     for item in gb:
-        if isinstance(item,str):
+        if isinstance(item, str):
             coerced_gb.append(item)
-        elif isinstance(item,dict):
+        elif isinstance(item, dict):
             col = item.get("column")
-            if isinstance(col,str):
+            if isinstance(col, str):
                 coerced_gb.append(col)
     plan["group_by"] = coerced_gb
 
@@ -471,27 +472,28 @@ def extract_query(question: str):
     plan = None
     if client and model:
         try:
-            plan = call_model_and_get_plan(client,model,prompt)
+            plan = call_model_and_get_plan(client, model, prompt)
         except:
             plan = None
 
     if not plan:
         metric = detect_metric_from_text(question)
         if metric:
-            plan = build_plan_from_metric(metric,question)
+            plan = build_plan_from_metric(metric, question)
         else:
-            return {"error":"Cannot interpret question (no model output and no metric detected)"}
+            return {"error": "Cannot interpret question (no model output and no metric detected)"}
 
     plan = coerce_plan_shapes(plan or {})
 
+    # parse time and value filters (initial)
     time_filters  = parse_time_filters(question)
-    value_filters = extract_value_filters(question,schema)
+    value_filters = extract_value_filters(question, schema)
 
     merged_filters = list(time_filters)
     time_cols = {f.get("column") for f in time_filters}
 
-    for f in plan.get("filters",[]):
-        if isinstance(f,dict) and f.get("column") not in time_cols:
+    for f in plan.get("filters", []):
+        if isinstance(f, dict) and f.get("column") not in time_cols:
             merged_filters.append(f)
 
     existing_cols = {f.get("column") for f in merged_filters}
@@ -499,11 +501,61 @@ def extract_query(question: str):
         if vf.get("column") not in existing_cols:
             merged_filters.append(vf)
 
+    # --- YOY detection: look for explicit two-year comparisons or "previous year" vs "this year" ---
+    # If detected, replace/add time filter as an IN filter with both years and ensure FinancialYear is grouped/selected.
+    yoy_years = None
+    qlow = (question or "").lower()
+
+    # 1) explicit pairs like "compare 2023 and 2024" or "2024 vs 2023"
+    m_pair = re.search(r"\b(20\d{2})\b.*\b(?:and|vs|v|vs\.|versus|to)\b.*\b(20\d{2})\b", qlow)
+    if m_pair:
+        y1 = int(m_pair.group(1))
+        y2 = int(m_pair.group(2))
+        # normalize order (descending most recent first)
+        yoy_years = sorted({y1, y2})
+
+    # 2) "compare previous year and this year" or "compare previous year with this year"
+    if not yoy_years:
+        if re.search(r"\b(previous year|last year)\b", qlow) and re.search(r"\b(this year|current year|present year)\b", qlow):
+            this_y = current_utc().year
+            prev_y = this_y - 1
+            # Interpret as financial years — use calendar_to_fy_year when needed? Keep as calendar years as user said years.
+            yoy_years = [prev_y, this_y]
+
+    # 3) "compare 2023 and last year" or "compare 2024 and previous year" (mixed)
+    if not yoy_years:
+        m_mixed = re.search(r"\b(20\d{2})\b.*\b(?:and|with|vs|versus)\b.*\b(previous year|last year|this year|current year)\b", qlow)
+        if m_mixed:
+            y_fixed = int(m_mixed.group(1))
+            if re.search(r"\b(previous year|last year)\b", qlow):
+                yoy_years = sorted({y_fixed, y_fixed - 1})
+            else:
+                this_y = current_utc().year
+                yoy_years = sorted({y_fixed, this_y})
+
+    # If we detected a YOY comparison, adjust merged_filters to include FinancialYear IN [years]
+    if yoy_years:
+        # Remove any existing FinancialYear equality filters from merged_filters
+        merged_filters = [f for f in merged_filters if not (f.get("column") == "FinancialYear" and f.get("operator") == "=")]
+        # Add an IN filter for the years (sql_builder supports operator 'in' with list)
+        merged_filters.append({"column": "FinancialYear", "operator": "in", "value": yoy_years})
+        # Ensure FinancialYear is in group_by so output is per-year (Format A)
+        gb = plan.get("group_by", []) or []
+        if "FinancialYear" not in gb:
+            gb.insert(0, "FinancialYear")
+            plan["group_by"] = gb
+        # Ensure FinancialYear is selected (so rows show year)
+        selects = plan.get("select", []) or []
+        if not any(isinstance(s, dict) and (s.get("column") == "FinancialYear" or s.get("alias") == "FinancialYear") for s in selects):
+            selects.insert(0, {"column": "FinancialYear", "expression": None, "aggregation": None, "alias": "FinancialYear"})
+            plan["select"] = selects
+
     plan["filters"] = merged_filters
 
-    selects  = plan.get("select",[]) or []
-    group_by = plan.get("group_by",[]) or []
-    order_by = plan.get("order_by",[]) or []
+    # Now proceed with your existing select/group_by/top logic
+    selects  = plan.get("select", []) or []
+    group_by = plan.get("group_by", []) or []
+    order_by = plan.get("order_by", []) or []
     limit    = plan.get("limit")
 
     #########################################################
@@ -517,15 +569,15 @@ def extract_query(question: str):
         alias = metric_key
 
         already = any(
-            isinstance(s,dict) and s.get("alias")==alias
+            isinstance(s, dict) and s.get("alias") == alias
             for s in selects
         )
         if not already:
             selects.append({
-                "column":None,
-                "expression":expr,
-                "aggregation":agg,
-                "alias":alias
+                "column": None,
+                "expression": expr,
+                "aggregation": agg,
+                "alias": alias
             })
 
     plan["select"] = selects
@@ -555,7 +607,7 @@ def extract_query(question: str):
 
     if dim_col:
         for col in schema.keys():
-            if col.lower()==dim_col.lower():
+            if col.lower() == dim_col.lower():
                 dim_col = col
                 break
 
@@ -563,16 +615,15 @@ def extract_query(question: str):
             group_by.insert(0, dim_col)
 
         dim_present = any(
-            isinstance(s,dict) and 
-            (s.get("alias")==dim_col or s.get("column")==dim_col)
+            isinstance(s, dict) and (s.get("alias") == dim_col or s.get("column") == dim_col)
             for s in selects
         )
         if not dim_present:
-            selects.insert(0,{
-                "column":dim_col,
-                "expression":None,
-                "aggregation":None,
-                "alias":dim_col
+            selects.insert(0, {
+                "column": dim_col,
+                "expression": None,
+                "aggregation": None,
+                "alias": dim_col
             })
 
     if top_n:
@@ -580,25 +631,25 @@ def extract_query(question: str):
 
     metric_alias = None
     for s in selects:
-        if isinstance(s,dict) and (s.get("aggregation") or s.get("expression")):
+        if isinstance(s, dict) and (s.get("aggregation") or s.get("expression")):
             metric_alias = s.get("alias")
             break
 
     if metric_alias:
         if direction:
-            order_by = [{"column":metric_alias,"direction":direction}]
+            order_by = [{"column": metric_alias, "direction": direction}]
         elif dim_col and not order_by:
-            order_by = [{"column":metric_alias,"direction":"DESC"}]
+            order_by = [{"column": metric_alias, "direction": "DESC"}]
 
     plan["select"]  = selects
-    plan["group_by"]= group_by
-    plan["order_by"]= order_by
+    plan["group_by"] = group_by
+    plan["order_by"] = order_by
 
     plan = normalize_plan(plan)
 
     valid = []
-    for s in plan.get("select",[]):
-        if isinstance(s,dict):
+    for s in plan.get("select", []):
+        if isinstance(s, dict):
             c = s.get("column")
             e = s.get("expression")
             if (c and c.strip()) or (e and e.strip()):
@@ -607,7 +658,7 @@ def extract_query(question: str):
     if not valid:
         metric = detect_metric_from_text(question)
         if metric:
-            return build_plan_from_metric(metric,question)
-        return {"error":"No valid SELECT expressions even after metric injection"}
+            return build_plan_from_metric(metric, question)
+        return {"error": "No valid SELECT expressions even after metric injection"}
 
     return plan
