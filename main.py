@@ -121,9 +121,7 @@ async def ask(q: Query):
         if not rows:
             return {"sql": sql, "result": "No data found", "rows": [], "columns": columns}
 
-        # -----------------------------------------------------
-        # Normalize row keys (keep exactly same functionality)
-        # -----------------------------------------------------
+        # Normalize row keys
         normalized_rows = []
         for row in rows:
             new_row = {}
@@ -131,56 +129,45 @@ async def ask(q: Query):
                 new_row[col] = row.get(col) or row.get(col.lower()) or row.get(col.upper())
             normalized_rows.append(new_row)
         rows = normalized_rows
-        # -----------------------------------------------------
 
-        # -----------------------------------------------------
-        # 🔥 YOY DIFFERENCE + GROWTH % CALCULATION (NEW BLOCK)
-        # -----------------------------------------------------
+        # ----------------------------------------------------------
+        # 🔥 YoY POST-PROCESSING LOGIC  (Format A)
+        # ----------------------------------------------------------
         q_low = q.question.lower()
+        yoy_keywords = ["difference", "growth", "increase", "yoy", "compare"]
 
-        if ("previous year" in q_low or 
-            "last year" in q_low or 
-            "growth" in q_low or 
-            "difference" in q_low or 
-            "yoy" in q_low):
+        if any(kw in q_low for kw in yoy_keywords) and "financialyear" in columns:
+            if len(rows) == 2:
+                # Sort rows by FinancialYear
+                rows_sorted = sorted(rows, key=lambda r: r["FinancialYear"])
+                prev_year = rows_sorted[0]["FinancialYear"]
+                prev_val  = float(rows_sorted[0][columns[1]])
 
-            # Expecting rows like:
-            # [{"FinancialYear":2024,"revenue":1000000}, {"FinancialYear":2023,"revenue":850000}]
-            if len(rows) >= 2 and ("FinancialYear" in rows[0]):
+                curr_year = rows_sorted[1]["FinancialYear"]
+                curr_val  = float(rows_sorted[1][columns[1]])
 
-                # Sort by year
-                rows_sorted = sorted(rows, key=lambda x: x["FinancialYear"])
-                y1, y2 = rows_sorted[-2], rows_sorted[-1]
+                diff = curr_val - prev_val
+                growth_pct = (diff / prev_val * 100) if prev_val != 0 else None
 
-                metric_col = None
-                for c in rows[0].keys():
-                    if c.lower() not in ["financialyear", "year"]:
-                        metric_col = c
-                        break
+                # Format response
+                result_text = (
+                    f"{curr_year} {columns[1]}: {curr_val:,.2f}\n"
+                    f"{prev_year} {columns[1]}: {prev_val:,.2f}\n"
+                    f"Difference: {diff:,.2f}\n"
+                    f"Growth %: {growth_pct:.2f}%"
+                    if growth_pct is not None
+                    else "Growth % cannot be computed"
+                )
 
-                if metric_col:
-                    v1 = float(y1[metric_col] or 0)
-                    v2 = float(y2[metric_col] or 0)
+                return {
+                    "sql": sql,
+                    "result": result_text,
+                    "rows": rows_sorted,
+                    "columns": columns
+                }
+        # ----------------------------------------------------------
 
-                    diff = v2 - v1
-                    growth = (diff / v1 * 100.0) if v1 != 0 else 0
-
-                    yoy_summary = (
-                        f"FY{y2['FinancialYear']} {metric_col}: {v2:,.2f}\n"
-                        f"FY{y1['FinancialYear']} {metric_col}: {v1:,.2f}\n"
-                        f"Difference: {diff:,.2f}\n"
-                        f"Growth %: {growth:.2f}%"
-                    )
-
-                    return {
-                        "sql": sql,
-                        "result": yoy_summary,
-                        "rows": rows,
-                        "columns": columns
-                    }
-        # -----------------------------------------------------
-
-        # Single scalar → natural language
+        # Normal logic for scalar
         if len(rows) == 1 and len(columns) == 1:
             val = rows[0].get(columns[0])
             if isinstance(val, (int, float)):
