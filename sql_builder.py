@@ -61,11 +61,9 @@ def build_sql_from_plan(plan, table, schema):
         if expr and isinstance(expr, str) and expr.strip():
             expr_clean = expr.strip()
 
-            # Expression already contains an aggregate e.g. SUM(), AVG(), COUNT()
             if is_aggregate_expression(expr_clean):
                 sql_select_parts.append(f"{expr_clean} AS [{alias}]")
             else:
-                # Wrap expression
                 if agg:
                     sql_select_parts.append(f"{agg}({expr_clean}) AS [{alias}]")
                 else:
@@ -140,48 +138,40 @@ def build_sql_from_plan(plan, table, schema):
             if not col:
                 continue
 
-            # If alias exists, use alias
             alias_list = [s.get("alias") for s in selects if isinstance(s, dict)]
+
             if col in alias_list:
                 ob_parts.append(f"[{col}] {direction}")
+            elif col in schema:
+                ob_parts.append(f"[{col}] {direction}")
             else:
-                # Otherwise fallback to raw column
-                if col in schema:
-                    ob_parts.append(f"[{col}] {direction}")
-                else:
-                    # As last resort treat as alias
-                    ob_parts.append(f"[{col}] {direction}")
+                ob_parts.append(f"[{col}] {direction}")
 
         if ob_parts:
             sql += " ORDER BY " + ", ".join(ob_parts)
 
     # -------------------------------------------------------------
-    # Fallback ordering when LIMIT is used and no ORDER BY
-    # -------------------------------------------------------------
-    # LIMIT / TOP
+    # LIMIT / TOP — ✔ FIXED INDENTATION
     # -------------------------------------------------------------
     if limit:
-    try:
-        n = int(limit)
-        sql = sql.replace("SELECT ", f"SELECT TOP {n} ", 1)
-    except:
-        pass
+        try:
+            n = int(limit)
+            sql = sql.replace("SELECT ", f"SELECT TOP {n} ", 1)
+        except:
+            pass
+
     # -------------------------------------------------------------
     # Output column order for UI
     # -------------------------------------------------------------
     columns = []
 
-    # group-by columns first
     for c in group_by:
         columns.append(c)
 
-    # then metric/dimension aliases
     for s in selects:
-        if isinstance(s, dict):
-            if s.get("alias"):
-                columns.append(s["alias"])
+        if isinstance(s, dict) and s.get("alias"):
+            columns.append(s["alias"])
 
-    # remove duplicates
     seen = set()
     cols_ordered = []
     for c in columns:
