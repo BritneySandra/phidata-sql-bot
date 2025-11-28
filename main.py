@@ -130,47 +130,46 @@ async def ask(q: Query):
             normalized_rows.append(new_row)
         rows = normalized_rows
 
-# ----------------------------------------------------------
-# 🔥 YoY POST-PROCESSING LOGIC  (Format A)
-# ----------------------------------------------------------
-q_low = q.question.lower()
-yoy_keywords = ["difference", "growth", "increase", "yoy", "compare"]
+        # ----------------------------------------------------------
+        # 🔥 YoY POST-PROCESSING LOGIC  (Format A)
+        # ----------------------------------------------------------
+        q_low = q.question.lower()
+        yoy_keywords = ["difference", "growth", "increase", "yoy", "compare"]
 
-# detect if the SELECT columns include FinancialYear (case-insensitive)
-has_finyear = any(c.lower() == "financialyear" for c in columns)
+        if any(kw in q_low for kw in yoy_keywords) and "FinancialYear" in columns:
+            if len(rows) == 2:
 
-if any(kw in q_low for kw in yoy_keywords) and has_finyear:
+                # Sort rows by year
+                rows_sorted = sorted(rows, key=lambda r: r["FinancialYear"])
 
-    if len(rows) == 2:
-        # Sort by FinancialYear numerically
-        rows_sorted = sorted(rows, key=lambda r: int(r["FinancialYear"]))
+                prev_year = rows_sorted[0]["FinancialYear"]
+                prev_val = float(rows_sorted[0][columns[1]])
 
-        prev_year = rows_sorted[0]["FinancialYear"]
-        prev_val  = float(rows_sorted[0][columns[1]])
+                curr_year = rows_sorted[1]["FinancialYear"]
+                curr_val = float(rows_sorted[1][columns[1]])
 
-        curr_year = rows_sorted[1]["FinancialYear"]
-        curr_val  = float(rows_sorted[1][columns[1]])
+                diff = curr_val - prev_val
+                growth_pct = (diff / prev_val * 100) if prev_val != 0 else None
 
-        diff = curr_val - prev_val
-        growth_pct = (diff / prev_val * 100) if prev_val != 0 else None
+                # FINAL TEXT RESULT
+                result_text = (
+                    f"{curr_year} {columns[1]}: {curr_val:,.2f}\n"
+                    f"{prev_year} {columns[1]}: {prev_val:,.2f}\n"
+                    f"Difference: {diff:,.2f}\n"
+                    f"Growth %: {growth_pct:.2f}%"
+                    if growth_pct is not None else
+                    "Growth % cannot be computed"
+                )
 
-        result_text = (
-            f"{prev_year} {columns[1]}: {prev_val:,.2f}\n"
-            f"{curr_year} {columns[1]}: {curr_val:,.2f}\n"
-            f"Difference: {diff:,.2f}\n"
-            f"Growth %: {growth_pct:.2f}%"
-            if growth_pct is not None else
-            "Growth % cannot be computed (division by zero)"
-        )
+                return {
+                    "sql": sql,
+                    "result": result_text,
+                    "rows": rows_sorted,
+                    "columns": columns
+                }
+        # ----------------------------------------------------------
 
-        return {
-            "sql": sql,
-            "result": result_text,
-            "rows": rows_sorted,
-            "columns": columns
-        }
-# ----------------------------------------------------------
-        # Normal scalar summary
+        # Normal logic for scalar
         if len(rows) == 1 and len(columns) == 1:
             val = rows[0].get(columns[0])
             if isinstance(val, (int, float)):
