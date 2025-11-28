@@ -131,7 +131,7 @@ async def ask(q: Query):
         rows = normalized_rows
 
         # ----------------------------------------------------------
-        # 🔥 YoY POST-PROCESSING LOGIC  (Format A)
+        # 🔥 YoY POST-PROCESSING LOGIC (Format A)
         # ----------------------------------------------------------
         q_low = q.question.lower()
         yoy_keywords = ["difference", "growth", "increase", "yoy", "compare"]
@@ -139,39 +139,38 @@ async def ask(q: Query):
         columns_lower = [c.lower() for c in columns]
 
         if any(kw in q_low for kw in yoy_keywords) and "financialyear" in columns_lower:
+            if len(rows) == 2:
 
-        if len(rows) == 2:
+                # Sort rows
+                year_col = next(c for c in columns if c.lower() == "financialyear")
+                metric_col = next(c for c in columns if c.lower() != "financialyear")
 
-        # Sort rows by FinancialYear
-        rows_sorted = sorted(rows, key=lambda r: r[next(c for c in columns if c.lower()=="financialyear")])
+                rows_sorted = sorted(rows, key=lambda r: r[year_col])
 
-        year_col = next(c for c in columns if c.lower()=="financialyear")
-        metric_col = next(c for c in columns if c.lower() != "financialyear")
+                prev_year = rows_sorted[0][year_col]
+                prev_val = float(rows_sorted[0][metric_col])
 
-        prev_year = rows_sorted[0][year_col]
-        prev_val  = float(rows_sorted[0][metric_col])
+                curr_year = rows_sorted[1][year_col]
+                curr_val = float(rows_sorted[1][metric_col])
 
-        curr_year = rows_sorted[1][year_col]
-        curr_val  = float(rows_sorted[1][metric_col])
+                diff = curr_val - prev_val
+                growth_pct = (diff / prev_val * 100) if prev_val != 0 else None
 
-        diff = curr_val - prev_val
-        growth_pct = (diff / prev_val * 100) if prev_val != 0 else None
+                result_text = (
+                    f"{prev_year} {metric_col}: {prev_val:,.2f}\n"
+                    f"{curr_year} {metric_col}: {curr_val:,.2f}\n"
+                    f"Difference: {diff:,.2f}\n"
+                    f"Growth %: {growth_pct:.2f}%"
+                    if growth_pct is not None
+                    else "Growth % cannot be computed"
+                )
 
-        result_text = (
-            f"{prev_year} {metric_col}: {prev_val:,.2f}\n"
-            f"{curr_year} {metric_col}: {curr_val:,.2f}\n"
-            f"Difference: {diff:,.2f}\n"
-            f"Growth %: {growth_pct:.2f}%"
-            if growth_pct is not None
-            else "Growth % cannot be computed"
-        )
-
-        return {
-            "sql": sql,
-            "result": result_text,
-            "rows": rows_sorted,
-            "columns": columns
-        }
+                return {
+                    "sql": sql,
+                    "result": result_text,
+                    "rows": rows_sorted,
+                    "columns": columns
+                }
         # ----------------------------------------------------------
 
         # Normal logic for scalar
