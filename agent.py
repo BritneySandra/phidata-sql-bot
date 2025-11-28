@@ -656,9 +656,35 @@ def extract_query(question: str):
                 valid.append(s)
 
     if not valid:
-        metric = detect_metric_from_text(question)
-        if metric:
-            return build_plan_from_metric(metric, question)
-        return {"error": "No valid SELECT expressions even after metric injection"}
+    metric = detect_metric_from_text(question)
+    if metric:
+        return build_plan_from_metric(metric, question)
+    return {"error": "No valid SELECT expressions even after metric injection"}
 
-    return plan
+# ---------------------------------------------------------
+# FINAL METRIC INJECTION (AFTER NORMALIZE)
+# ---------------------------------------------------------
+metric_key = detect_metric_from_text(question)
+if metric_key and metric_key in METRICS:
+    metric_info = METRICS[metric_key]
+
+    expr  = metric_info.get("expression")
+    agg   = metric_info.get("aggregation")
+    alias = metric_key
+
+    # Check if already exists
+    already = any(
+        isinstance(s, dict) and s.get("alias") == alias
+        for s in plan["select"]
+    )
+
+    if not already:
+        plan["select"].append({
+            "column": None,
+            "expression": expr,
+            "aggregation": agg,
+            "alias": alias
+        })
+
+return plan
+
