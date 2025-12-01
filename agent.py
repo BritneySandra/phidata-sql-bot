@@ -63,6 +63,7 @@ DIMENSION_MAP = {
     "jobtype": "JobType",
     "job status": "JobStatus",
     "jobstatus": "JobStatus",
+    # transport additions
     "transport": "TransportMode",
     "transport mode": "TransportMode",
     "mode": "TransportMode",
@@ -634,28 +635,24 @@ def extract_query(question: str):
     dim_col = detect_dimension_from_text(question, schema)
     top_n, direction, has_top = extract_top_n_and_direction(question)
 
-   #########################################################
-# 🔥 NUMERIC-LIMIT PATCH (YEAR-SAFE)
-# Only treat small numbers (1–100) as TOP limits.
-# Ignore years (1900–2099)
-#########################################################
-explicit_n = None
-if not top_n:  # Only override if LLM didn't set top_n
-    m = re.search(r"\b(\d+)\b", question)
-    if m:
-        num = int(m.group(1))
+    #########################################################
+    # 🔥 NUMERIC-LIMIT PATCH (YEAR-SAFE)
+    # Only treat small numbers (1–100) as TOP limits.
+    # Ignore years (1900–2099)
+    #########################################################
+    explicit_n = None
+    if not top_n:  # Only override when LLM did NOT already set a top_n
+        m = re.search(r"\b(\d+)\b", question)
+        if m:
+            num = int(m.group(1))
+            # treat typical top-n values as limits, ignore likely years
+            if 1 <= num <= 100:
+                explicit_n = num
 
-        # Ignore year-like values
-        if 1 <= num <= 100:
-            explicit_n = num
-        else:
-            explicit_n = None  # treat 2023, 2024 as normal years, not TOP limits
-
-if explicit_n:
-    plan["limit"] = explicit_n
-    top_n = explicit_n
-#########################################################
-
+    if explicit_n:
+        plan["limit"] = explicit_n
+        top_n = explicit_n
+    #########################################################
 
     if dim_col:
         for col in schema.keys():
