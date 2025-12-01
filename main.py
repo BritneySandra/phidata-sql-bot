@@ -72,23 +72,23 @@ async function ask() {
 
     let html = "<b>SQL:</b><br>" + (data.sql || "(none)") + "<br><br>";
 
-   if (data.rows && data.rows.length > 0) {
-    html += "<b>Result:</b><br>";
+    if (data.rows && data.rows.length > 0) {
+        html += "<b>Result:</b><br>";
 
-    let cols = Object.keys(data.rows[0]);
+        let cols = Object.keys(data.rows[0]);
 
-    html += "<table class='result-table'><tr>";
-    cols.forEach(c => html += "<th>" + c + "</th>");
-    html += "</tr>";
-
-    data.rows.forEach(r => {
-        html += "<tr>";
-        cols.forEach(c => html += "<td>" + (r[c] ?? '') + "</td>");
+        html += "<table class='result-table'><tr>";
+        cols.forEach(c => html += "<th>" + c + "</th>");
         html += "</tr>";
-    });
 
-    html += "</table>";
-} else {
+        data.rows.forEach(r => {
+            html += "<tr>";
+            cols.forEach(c => html += "<td>" + (r[c] ?? '') + "</td>");
+            html += "</tr>";
+        });
+
+        html += "</table>";
+    } else {
         html += "<b>Answer:</b><br>" + (data.result || "No data");
     }
     document.getElementById("a").innerHTML = html;
@@ -121,59 +121,85 @@ async def ask(q: Query):
         if not rows:
             return {"sql": sql, "result": "No data found", "rows": [], "columns": columns}
 
-        # Normalize row keys
+        # --------------------------------------------------------------
+        # Normalize rows into dict format because run_sql returns dicts
+        # --------------------------------------------------------------
         normalized_rows = []
         for row in rows:
             new_row = {}
             for col in columns:
-                new_row[col] = row.get(col) or row.get(col.lower()) or row.get(col.upper())
+                new_row[col] = (
+                    row.get(col)
+                    or row.get(col.lower())
+                    or row.get(col.upper())
+                )
             normalized_rows.append(new_row)
         rows = normalized_rows
 
         # ----------------------------------------------------------
-        # 🔥 YoY POST-PROCESSING LOGIC (Format A)
+        # 🔥 YoY POST-PROCESSING LOGIC (Python-only)
         # ----------------------------------------------------------
+        def compute_yoy(rows, columns):
+            if len(rows) != 2:
+                return None
+
+            cols_lower = [c.lower() for c in columns]
+            if "financialyear" not in cols_lower:
+                return None
+
+            # Identify FinancialYear + metric column
+            year_col = next(c for c in columns if c.lower() == "financialyear")
+            metric_col = next(c for c in columns if c.lower() != "financialyear")
+
+            # Sort rows by year
+            rows_sorted = sorted(rows, key=lambda r: r[year_col])
+
+            prev_year = rows_sorted[0][year_col]
+            prev_val = float(rows_sorted[0][metric_col] or 0)
+
+            curr_year = rows_sorted[1][year_col]
+            curr_val = float(rows_sorted[1][metric_col] or 0)
+
+            diff = curr_val - prev_val
+            growth_pct = (diff / prev_val * 100) if prev_val != 0 else None
+
+            return {
+                "prev_year": prev_year,
+                "prev_value": prev_val,
+                "curr_year": curr_year,
+                "curr_value": curr_val,
+                "difference": diff,
+                "growth_pct": growth_pct
+            }
+
+        # If question contains YOY intent
+        yoy_keywords = ["difference", "growth", "increase", "yoy", "compare", "previous year", "this year"]
         q_low = q.question.lower()
-        yoy_keywords = ["difference", "growth", "increase", "yoy", "compare"]
 
-        columns_lower = [c.lower() for c in columns]
+        yoy_stats = None
+        if any(k in q_low for k in yoy_keywords):
+            yoy_stats = compute_yoy(rows, columns)
 
-        if any(kw in q_low for kw in yoy_keywords) and "financialyear" in columns_lower:
-            if len(rows) == 2:
+        if yoy_stats:
+            result_text = (
+                f"{yoy_stats['prev_year']} value: {yoy_stats['prev_value']:,.2f}\n"
+                f"{yoy_stats['curr_year']} value: {yoy_stats['curr_value']:,.2f}\n"
+                f"Difference: {yoy_stats['difference']:,.2f}\n"
+                f"Growth %: {yoy_stats['growth_pct']:.2f}%"
+                if yoy_stats["growth_pct"] is not None
+                else "Growth % cannot be computed"
+            )
 
-                # Sort rows
-                year_col = next(c for c in columns if c.lower() == "financialyear")
-                metric_col = next(c for c in columns if c.lower() != "financialyear")
+            return {
+                "sql": sql,
+                "result": result_text,
+                "rows": rows,
+                "columns": columns
+            }
 
-                rows_sorted = sorted(rows, key=lambda r: r[year_col])
-
-                prev_year = rows_sorted[0][year_col]
-                prev_val = float(rows_sorted[0][metric_col])
-
-                curr_year = rows_sorted[1][year_col]
-                curr_val = float(rows_sorted[1][metric_col])
-
-                diff = curr_val - prev_val
-                growth_pct = (diff / prev_val * 100) if prev_val != 0 else None
-
-                result_text = (
-                    f"{prev_year} {metric_col}: {prev_val:,.2f}\n"
-                    f"{curr_year} {metric_col}: {curr_val:,.2f}\n"
-                    f"Difference: {diff:,.2f}\n"
-                    f"Growth %: {growth_pct:.2f}%"
-                    if growth_pct is not None
-                    else "Growth % cannot be computed"
-                )
-
-                return {
-                    "sql": sql,
-                    "result": result_text,
-                    "rows": rows_sorted,
-                    "columns": columns
-                }
         # ----------------------------------------------------------
-
-        # Normal logic for scalar
+        # Normal single-value summary
+        # ----------------------------------------------------------
         if len(rows) == 1 and len(columns) == 1:
             val = rows[0].get(columns[0])
             if isinstance(val, (int, float)):
