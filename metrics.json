@@ -20,8 +20,21 @@
   "profit_percentage": {
     "expression": "CASE WHEN SUM(COALESCE([CSTAmount],0) + COALESCE([ACRAmount],0)) = 0 THEN NULL ELSE (SUM(COALESCE([JobProfit],0)) / SUM(COALESCE([CSTAmount],0) + COALESCE([ACRAmount],0))) * 100 END",
     "aggregation": null,
-    "synonyms": ["profit percent", "profit %", "margin %", "profit ratio"]
-  },
+    "synonyms": [
+        "profit percent",
+        "profit %",
+        "margin %",
+        "profit ratio",
+        "profit percentage",
+        "profit pct",
+        "profit pct.",
+        "profitpercent",
+        "profitpercentage",
+        "profit_percent",
+        "profit%"
+    ]
+}
+,
 
   "total_job_count": {
     "expression": "COUNT(DISTINCT [JobNumber])",
