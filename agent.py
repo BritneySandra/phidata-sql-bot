@@ -280,10 +280,37 @@ def detect_dimension_from_text(text: str, schema: dict):
 
 
 def detect_metric_from_text(text: str):
+    """
+    Improved metric detection:
+    - Prioritize percentage-based metrics when question contains '%' or 'percent'
+    - Prevents 'profit %' from being matched as 'profit'
+    - Falls back to normal synonym matching otherwise
+    """
     t = (text or "").lower()
+
+    # PRIORITY 1: explicit percent indicators in question
+    if "%" in t or "percent" in t or "percentage" in t:
+        # First check synonyms that themselves indicate percent-like terms
+        # (e.g., if metrics.json uses synonyms like "profit percent")
+        for syn, metric in SYNONYM_MAP.items():
+            if syn in t and ( "%" in syn or "percent" in syn or "percentage" in syn ):
+                return metric
+
+        # If question mentions profit and percent, prefer profit_percentage if available
+        if "profit" in t and ("%" in t or "percent" in t or "percentage" in t):
+            if "profit_percentage" in METRICS:
+                return "profit_percentage"
+
+    # PRIORITY 2: explicit phrases
+    if "profit %" in t or "profit percent" in t or "profit percentage" in t or "margin %" in t or "margin percent" in t:
+        if "profit_percentage" in METRICS:
+            return "profit_percentage"
+
+    # PRIORITY 3: exact synonym matches (fall back)
     for syn, metric in SYNONYM_MAP.items():
         if syn in t:
             return metric
+
     return None
 
 ############################################################
