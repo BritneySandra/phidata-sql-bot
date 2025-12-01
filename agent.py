@@ -280,56 +280,10 @@ def detect_dimension_from_text(text: str, schema: dict):
 
 
 def detect_metric_from_text(text: str):
-    """
-    Robust metric detection (profit % fix):
-    - Prioritize percentage-aware phrases and symbols ('%', 'percent', 'percentage')
-      and map them to the percent metric (profit_percentage) if present in METRICS.
-    - Look for explicit percent phrases first (e.g., 'profit %', 'profit percent', 'margin percent').
-    - Then match synonyms with a longest-first strategy so multi-word synonyms
-      like 'profit percent' are matched before 'profit'.
-    - Fallback to previous synonym matching behavior.
-    """
     t = (text or "").lower()
-
-    # 1) If the question contains explicit percent markers, prefer percent metrics
-    if "%" in t or "percent" in t or "percentage" in t:
-        # If any synonym explicitly mentions percent or % and is present in the question, return its metric
-        for syn, metric in SYNONYM_MAP.items():
-            if ("%" in syn) or ("percent" in syn) or ("percentage" in syn):
-                if syn in t:
-                    return metric
-
-        # If the question references profit/margin with a percent intent, prefer profit_percentage
-        if ("profit" in t or "margin" in t):
-            if "profit_percentage" in METRICS:
-                return "profit_percentage"
-
-    # 2) Explicit phrase matches (cover common variants)
-    explicit_pct_phrases = [
-        "profit %",
-        "profit percent",
-        "profit percentage",
-        "margin %",
-        "margin percent",
-        "margin percentage",
-        "profit%","margin%"
-    ]
-    for ph in explicit_pct_phrases:
-        if ph in t:
-            if "profit_percentage" in METRICS:
-                return "profit_percentage"
-
-    # 3) Longest-first synonym matching to avoid matching 'profit' before 'profit percent'
-    sorted_syns = sorted(SYNONYM_MAP.items(), key=lambda kv: -len(kv[0]))
-    for syn, metric in sorted_syns:
+    for syn, metric in SYNONYM_MAP.items():
         if syn in t:
             return metric
-
-    # 4) Fallback: if metric name itself present
-    for metric_key in METRICS.keys():
-        if metric_key.lower() in t:
-            return metric_key
-
     return None
 
 ############################################################
