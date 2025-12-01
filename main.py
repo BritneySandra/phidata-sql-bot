@@ -1,10 +1,10 @@
-# main.py - FastAPI endpoints and UI
+# main.py - FastAPI endpoints and UI (with SQL YoY logic for Year-over-Year)
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from agent import extract_query, get_schema
+from agent import extract_query, get_schema, METRICS, detect_metric_from_text
 from sql_builder import build_sql_from_plan
 from sql_runner import run_sql
 
@@ -72,23 +72,23 @@ async function ask() {
 
     let html = "<b>SQL:</b><br>" + (data.sql || "(none)") + "<br><br>";
 
-    if (data.rows && data.rows.length > 0) {
-        html += "<b>Result:</b><br>";
+   if (data.rows && data.rows.length > 0) {
+    html += "<b>Result:</b><br>";
 
-        let cols = Object.keys(data.rows[0]);
+    let cols = Object.keys(data.rows[0]);
 
-        html += "<table class='result-table'><tr>";
-        cols.forEach(c => html += "<th>" + c + "</th>");
+    html += "<table class='result-table'><tr>";
+    cols.forEach(c => html += "<th>" + c + "</th>");
+    html += "</tr>";
+
+    data.rows.forEach(r => {
+        html += "<tr>";
+        cols.forEach(c => html += "<td>" + (r[c] ?? '') + "</td>");
         html += "</tr>";
+    });
 
-        data.rows.forEach(r => {
-            html += "<tr>";
-            cols.forEach(c => html += "<td>" + (r[c] ?? '') + "</td>");
-            html += "</tr>";
-        });
-
-        html += "</table>";
-    } else {
+    html += "</table>";
+} else {
         html += "<b>Answer:</b><br>" + (data.result || "No data");
     }
     document.getElementById("a").innerHTML = html;
@@ -103,17 +103,138 @@ class Query(BaseModel):
     question: str
 
 
+def _filters_to_where(filters, schema, exclude_columns=None):
+    """
+    Convert plan filters -> WHERE clause text and params.
+    exclude_columns: set/list of column names to skip (e.g. FinancialYear IN handled separately)
+    """
+    if exclude_columns is None:
+        exclude_columns = set()
+
+    where_clauses = []
+    params = []
+
+    for flt in filters:
+        if not isinstance(flt, dict):
+            continue
+        col = flt.get("column")
+        if not col or col in exclude_columns or col not in schema:
+            continue
+        op = (flt.get("operator") or "=").lower()
+        val = flt.get("value")
+
+        if op == "in" and isinstance(val, (list, tuple)):
+            placeholders = ", ".join("?" for _ in val)
+            where_clauses.append(f"[{col}] IN ({placeholders})")
+            params.extend(val)
+        else:
+            if op not in ("=", ">", "<", "<=", ">=", "<>", "!=", "like"):
+                op = "="
+            where_clauses.append(f"[{col}] {op} ?")
+            params.append(val)
+
+    return where_clauses, params
+
+
 @app.post("/ask")
 async def ask(q: Query):
     schema = get_schema()
 
     try:
+        # get the AI plan
         plan = extract_query(q.question)
 
         # If AI returned error
         if isinstance(plan, dict) and plan.get("error"):
             return {"sql": None, "result": f"AI error: {plan.get('error')}", "rows": [], "columns": []}
 
+        # ---------- YOY SQL detection & SQL generation ----------
+        # We detect YOY when the plan contains FinancialYear operator 'in' with a list of years
+        yoy_filter = None
+        for f in plan.get("filters", []) or []:
+            if isinstance(f, dict) and f.get("column") == "FinancialYear" and str(f.get("operator")).lower() == "in" and isinstance(f.get("value"), (list, tuple)):
+                yoy_filter = f
+                break
+
+        # detect metric from question (agent helper)
+        metric_key = detect_metric_from_text(q.question)
+        metric_info = METRICS.get(metric_key) if metric_key else None
+
+        # Only apply SQL-YOY when:
+        #  1) yoy_filter is present (FinancialYear IN ...)
+        #  2) metric is defined in metrics.json
+        #  3) metric expression is present
+        if yoy_filter and metric_info and metric_info.get("expression"):
+            # Only Year-over-Year (user requested)
+            years = list(yoy_filter.get("value"))
+            # ensure length >= 2 (we expect 2 but can handle n)
+            if len(years) >= 2:
+                # build custom SQL using a CTE that aggregates metric per FinancialYear, then use LAG
+                metric_expr = metric_info.get("expression").strip()
+                # We'll call the aggregated column Metric
+                metric_alias = metric_key  # e.g., 'revenue' or 'cost'
+                display_alias = metric_alias  # keep same alias for returned column
+
+                # Build WHERE clause from other filters (exclude the FinancialYear IN filter)
+                other_filters = [f for f in plan.get("filters", []) or [] if not (isinstance(f, dict) and f.get("column") == "FinancialYear")]
+                where_clauses, params = _filters_to_where(other_filters, schema, exclude_columns=set())
+
+                where_sql = ""
+                if where_clauses:
+                    where_sql = "WHERE " + " AND ".join(where_clauses)
+
+                # Build the CTE + final query
+                # Note: We restrict the CTE by FinancialYear IN (...) as well (so only the requested years show)
+                placeholders_years = ", ".join("?" for _ in years)
+                params_for_query = list(params)  # other filter params first
+                params_for_query.extend(years)   # then the years for the CTE filter
+
+                cte = f"""
+WITH yearly AS (
+  SELECT
+    [FinancialYear],
+    SUM({metric_expr}) AS Metric
+  FROM {TABLE}
+  {where_sql + (' AND ' if where_sql else 'WHERE ') } [FinancialYear] IN ({placeholders_years})
+  GROUP BY [FinancialYear]
+)
+SELECT
+  [FinancialYear] AS FinancialYear,
+  Metric AS [{display_alias}],
+  LAG(Metric) OVER (ORDER BY [FinancialYear]) AS Prev{display_alias},
+  (Metric - LAG(Metric) OVER (ORDER BY [FinancialYear])) AS Difference,
+  CASE
+    WHEN LAG(Metric) OVER (ORDER BY [FinancialYear]) = 0 THEN NULL
+    ELSE ((Metric - LAG(Metric) OVER (ORDER BY [FinancialYear])) * 100.0) / LAG(Metric) OVER (ORDER BY [FinancialYear])
+  END AS GrowthPct
+FROM yearly
+ORDER BY [FinancialYear];
+""".strip()
+
+                # Execute and return
+                rows = run_sql(cte, params_for_query)
+
+                # Normalize keys like elsewhere
+                normalized_rows = []
+                for row in rows:
+                    new_row = {}
+                    for k, v in row.items():
+                        # keep the key names as returned by SQL (they are FinancialYear, revenue/cost, Prev..., Difference, GrowthPct)
+                        new_row[k] = v
+                    normalized_rows.append(new_row)
+                rows = normalized_rows
+
+                # Determine columns order for UI
+                columns = ["FinancialYear", display_alias, f"Prev{display_alias}", "Difference", "GrowthPct"]
+
+                return {
+                    "sql": cte,
+                    "result": f"{len(rows)} rows returned.",
+                    "rows": rows,
+                    "columns": columns
+                }
+
+        # ---------- FALLBACK: build normal SQL and run ----------
         sql, params, columns = build_sql_from_plan(plan, TABLE, schema)
         rows = run_sql(sql, params)
 
@@ -121,116 +242,16 @@ async def ask(q: Query):
         if not rows:
             return {"sql": sql, "result": "No data found", "rows": [], "columns": columns}
 
-        # --------------------------------------------------------------
-        # Normalize rows into dict format because run_sql returns dicts
-        # --------------------------------------------------------------
+        # Normalize row keys
         normalized_rows = []
         for row in rows:
             new_row = {}
             for col in columns:
-                new_row[col] = (
-                    row.get(col)
-                    or row.get(col.lower())
-                    or row.get(col.upper())
-                )
+                new_row[col] = row.get(col) or row.get(col.lower()) or row.get(col.upper())
             normalized_rows.append(new_row)
         rows = normalized_rows
 
-                # ----------------------------------------------------------
-        # 🔥 YoY POST-PROCESSING LOGIC (Python-only, stable)
-        # ----------------------------------------------------------
-        def compute_yoy(rows, columns):
-            """
-            Computes YoY metrics when exactly 2 rows are returned:
-            prev_year, curr_year, difference, growth %
-            """
-            if len(rows) != 2:
-                return None
-
-            # Detect FinancialYear column
-            year_col = None
-            for c in columns:
-                if c.lower() == "financialyear":
-                    year_col = c
-                    break
-
-            if not year_col:
-                return None
-
-            # Detect metric column = first numeric non-year column
-            sample = rows[0]
-            metric_col = None
-            for c in columns:
-                if c.lower() != "financialyear":
-                    if isinstance(sample.get(c), (int, float)):
-                        metric_col = c
-                        break
-
-            if not metric_col:
-                return None
-
-            # Sort rows by financial year (ascending)
-            rows_sorted = sorted(rows, key=lambda r: r[year_col])
-
-            prev_year = rows_sorted[0][year_col]
-            prev_val = float(rows_sorted[0][metric_col] or 0)
-
-            curr_year = rows_sorted[1][year_col]
-            curr_val = float(rows_sorted[1][metric_col] or 0)
-
-            diff = curr_val - prev_val
-            growth_pct = (diff / prev_val * 100) if prev_val != 0 else None
-
-            return {
-                "prev_year": prev_year,
-                "prev_value": prev_val,
-                "curr_year": curr_year,
-                "curr_value": curr_val,
-                "difference": diff,
-                "growth_pct": growth_pct,
-                "metric_col": metric_col
-            }
-
-        # Detect YoY questions
-        yoy_keywords = [
-            "difference", "growth", "increase",
-            "yoy", "compare",
-            "previous year", "last year", "this year", "current year"
-        ]
-
-        q_low = q.question.lower()
-        yoy_stats = None
-
-        if any(k in q_low for k in yoy_keywords):
-            yoy_stats = compute_yoy(rows, columns)
-
-        # If YoY computed → return YoY result instead of table summary
-        if yoy_stats:
-            metric_name = yoy_stats["metric_col"]
-
-            if yoy_stats["growth_pct"] is not None:
-                result_text = (
-                    f"{yoy_stats['prev_year']} {metric_name}: {yoy_stats['prev_value']:,.2f}\n"
-                    f"{yoy_stats['curr_year']} {metric_name}: {yoy_stats['curr_value']:,.2f}\n"
-                    f"Difference: {yoy_stats['difference']:,.2f}\n"
-                    f"Growth %: {yoy_stats['growth_pct']:.2f}%"
-                )
-            else:
-                result_text = (
-                    f"{yoy_stats['prev_year']} {metric_name}: {yoy_stats['prev_value']:,.2f}\n"
-                    f"{yoy_stats['curr_year']} {metric_name}: {yoy_stats['curr_value']:,.2f}\n"
-                    "Growth % cannot be computed"
-                )
-
-            return {
-                "sql": sql,
-                "result": result_text,
-                "rows": rows,
-                "columns": columns
-            }
-        # ----------------------------------------------------------
-        # Normal single-value summary
-        # ----------------------------------------------------------
+        # Normal logic for scalar
         if len(rows) == 1 and len(columns) == 1:
             val = rows[0].get(columns[0])
             if isinstance(val, (int, float)):
