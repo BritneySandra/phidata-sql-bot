@@ -136,22 +136,40 @@ async def ask(q: Query):
             normalized_rows.append(new_row)
         rows = normalized_rows
 
-        # ----------------------------------------------------------
-        # 🔥 YoY POST-PROCESSING LOGIC (Python-only)
+                # ----------------------------------------------------------
+        # 🔥 YoY POST-PROCESSING LOGIC (Python-only, stable)
         # ----------------------------------------------------------
         def compute_yoy(rows, columns):
+            """
+            Computes YoY metrics when exactly 2 rows are returned:
+            prev_year, curr_year, difference, growth %
+            """
             if len(rows) != 2:
                 return None
 
-            cols_lower = [c.lower() for c in columns]
-            if "financialyear" not in cols_lower:
+            # Detect FinancialYear column
+            year_col = None
+            for c in columns:
+                if c.lower() == "financialyear":
+                    year_col = c
+                    break
+
+            if not year_col:
                 return None
 
-            # Identify FinancialYear + metric column
-            year_col = next(c for c in columns if c.lower() == "financialyear")
-            metric_col = next(c for c in columns if c.lower() != "financialyear")
+            # Detect metric column = first numeric non-year column
+            sample = rows[0]
+            metric_col = None
+            for c in columns:
+                if c.lower() != "financialyear":
+                    if isinstance(sample.get(c), (int, float)):
+                        metric_col = c
+                        break
 
-            # Sort rows by year
+            if not metric_col:
+                return None
+
+            # Sort rows by financial year (ascending)
             rows_sorted = sorted(rows, key=lambda r: r[year_col])
 
             prev_year = rows_sorted[0][year_col]
@@ -169,26 +187,40 @@ async def ask(q: Query):
                 "curr_year": curr_year,
                 "curr_value": curr_val,
                 "difference": diff,
-                "growth_pct": growth_pct
+                "growth_pct": growth_pct,
+                "metric_col": metric_col
             }
 
-        # If question contains YOY intent
-        yoy_keywords = ["difference", "growth", "increase", "yoy", "compare", "previous year", "this year"]
-        q_low = q.question.lower()
+        # Detect YoY questions
+        yoy_keywords = [
+            "difference", "growth", "increase",
+            "yoy", "compare",
+            "previous year", "last year", "this year", "current year"
+        ]
 
+        q_low = q.question.lower()
         yoy_stats = None
+
         if any(k in q_low for k in yoy_keywords):
             yoy_stats = compute_yoy(rows, columns)
 
+        # If YoY computed → return YoY result instead of table summary
         if yoy_stats:
-            result_text = (
-                f"{yoy_stats['prev_year']} value: {yoy_stats['prev_value']:,.2f}\n"
-                f"{yoy_stats['curr_year']} value: {yoy_stats['curr_value']:,.2f}\n"
-                f"Difference: {yoy_stats['difference']:,.2f}\n"
-                f"Growth %: {yoy_stats['growth_pct']:.2f}%"
-                if yoy_stats["growth_pct"] is not None
-                else "Growth % cannot be computed"
-            )
+            metric_name = yoy_stats["metric_col"]
+
+            if yoy_stats["growth_pct"] is not None:
+                result_text = (
+                    f"{yoy_stats['prev_year']} {metric_name}: {yoy_stats['prev_value']:,.2f}\n"
+                    f"{yoy_stats['curr_year']} {metric_name}: {yoy_stats['curr_value']:,.2f}\n"
+                    f"Difference: {yoy_stats['difference']:,.2f}\n"
+                    f"Growth %: {yoy_stats['growth_pct']:.2f}%"
+                )
+            else:
+                result_text = (
+                    f"{yoy_stats['prev_year']} {metric_name}: {yoy_stats['prev_value']:,.2f}\n"
+                    f"{yoy_stats['curr_year']} {metric_name}: {yoy_stats['curr_value']:,.2f}\n"
+                    "Growth % cannot be computed"
+                )
 
             return {
                 "sql": sql,
@@ -196,7 +228,6 @@ async def ask(q: Query):
                 "rows": rows,
                 "columns": columns
             }
-
         # ----------------------------------------------------------
         # Normal single-value summary
         # ----------------------------------------------------------
