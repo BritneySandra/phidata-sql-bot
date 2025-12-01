@@ -2,7 +2,7 @@
   "revenue": {
     "expression": "COALESCE([REVAmount],0) + COALESCE([WIPAmount],0)",
     "aggregation": "SUM",
-    "synonyms": ["revenue", "sales", "turnover", "income", "rev"]
+    "synonyms": ["revenue", "sales", "turnover", "income"]
   },
 
   "cost": {

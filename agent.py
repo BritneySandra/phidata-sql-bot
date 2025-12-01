@@ -280,10 +280,51 @@ def detect_dimension_from_text(text: str, schema: dict):
 
 
 def detect_metric_from_text(text: str):
+    """
+    Robust metric detection:
+    - Prefer explicit percent requests to map to *_percentage metrics (e.g., profit_percentage).
+    - Use whole-word matching for synonyms (avoid substring matches).
+    - Prefer longer synonym matches first (to avoid 'rev' matching 'revenue' incorrectly).
+    - Fall back to any synonym match otherwise.
+    """
     t = (text or "").lower()
+
+    # Quick empty guard
+    if not t or not SYNONYM_MAP:
+        return None
+
+    # 1) If question explicitly requests percentage, prefer *_percentage metrics.
+    if "%" in t or " percent" in t or "percentage" in t:
+        # If a profit percentage metric exists, and the user mentions profit, prefer it
+        if "profit_percentage" in METRICS and re.search(r"\bprofit\b", t):
+            return "profit_percentage"
+        # Generic: look for any metric whose key name contains 'percentage' or synonyms that contain 'percent'
+        for key, meta in METRICS.items():
+            if key.lower().endswith("percentage") or "percentage" in key.lower() or "percent" in key.lower():
+                # check if any of its synonyms appear as whole words in the question
+                syns = meta.get("synonyms", []) if isinstance(meta, dict) else []
+                for s in ([key] + syns):
+                    if re.search(rf"\b{re.escape(s.lower())}\b", t):
+                        return key
+
+    # 2) Priority explicit percent phrases (e.g. "profit %", "profit percent", "margin %")
+    if re.search(r"\b(profit\s*%|profit percent|profit percentage|margin\s*%|margin percent|margin percentage)\b", t):
+        if "profit_percentage" in METRICS:
+            return "profit_percentage"
+
+    # 3) Whole-word synonym matching (longer synonyms first to avoid substring issues)
+    syn_list = sorted(SYNONYM_MAP.keys(), key=lambda s: len(s), reverse=True)
+    for syn in syn_list:
+        # build whole-word regex (handles multi-word synonyms)
+        pattern = rf"\b{re.escape(syn)}\b"
+        if re.search(pattern, t):
+            return SYNONYM_MAP[syn]
+
+    # 4) As a last resort, try simple contains (fallback)
     for syn, metric in SYNONYM_MAP.items():
         if syn in t:
             return metric
+
     return None
 
 ############################################################
