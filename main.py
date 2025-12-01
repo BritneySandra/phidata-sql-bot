@@ -211,17 +211,31 @@ FROM yearly
 ORDER BY [FinancialYear];
 """.strip()
 
-                # Execute and return
                 rows = run_sql(cte, params_for_query)
 
-                # Normalize keys like elsewhere
+                # Normalize + FIX invalid floats (NaN, Infinity)
+                def fix_float(v):
+                    try:
+                        if v is None:
+                            return None
+                        if isinstance(v, float):
+                            if v != v:            # NaN
+                                return None
+                            if v == float("inf"): # Infinity
+                                return None
+                            if v == float("-inf"):
+                                return None
+                        return v
+                    except:
+                        return v
+
                 normalized_rows = []
                 for row in rows:
                     new_row = {}
                     for k, v in row.items():
-                        # keep the key names as returned by SQL (they are FinancialYear, revenue/cost, Prev..., Difference, GrowthPct)
-                        new_row[k] = v
+                        new_row[k] = fix_float(v)
                     normalized_rows.append(new_row)
+
                 rows = normalized_rows
 
                 # Determine columns order for UI
