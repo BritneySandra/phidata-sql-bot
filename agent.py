@@ -1,9 +1,8 @@
+
 # agent.py — CLEAN + STRICT VALUE FILTERS + stable dimension/TOP/time logic
-# Updated with:
-# 1) FORCE METRIC DETECTED FROM QUESTION
-# 2) Numeric-limit patch inserted IMMEDIATELY AFTER extract_top_n_and_direction()
-# 3) YOY detection: when user asks to compare two years (or previous/this), force FinancialYear IN (...) and group_by FinancialYear
-# Minimal, focused changes only — rest of your working logic preserved.
+# Updated: includes YEAR-safe top-n detection, robust metric detection (profit %), transport dimension fixes,
+# YOY detection preserved. This is the full agent.py file requested by the user.
+# NOTE: adjust TABLE_NAME and environment variables as needed in your deployment.
 
 import os
 import json
@@ -231,15 +230,29 @@ def extract_value_filters(question: str, schema: dict):
     if not schema:
         return filters
 
+    # look for explicit "column = value" like "TransportMode = sea" or "transport sea"
     for col in schema.keys():
         col_low = col.lower()
         if col_low not in q:
             continue
 
-        m = re.search(rf"{re.escape(col_low)}\s*(?:is|=|:)?\s*([a-zA-Z0-9\-_]+)", q)
+        # value after column name
+        m = re.search(rf"{re.escape(col_low)}\s*(?:is|=|:|=)?\s*([a-zA-Z0-9\-_]+)", q)
         if m:
             filters.append({"column": col, "operator": "=", "value": m.group(1)})
+            continue
 
+    # fallback: dimension synonyms (e.g., "transport sea")
+    # Look for patterns like "transport mode sea" or "transport sea"
+    for syn, col in DIM_LOOKUP.items():
+        if syn in q:
+            # capture following token as value
+            m = re.search(rf"{re.escape(syn)}\s+([A-Za-z0-9\-_]+)", q)
+            if m:
+                # map synonym to actual column name if present in schema
+                actual_col = col if (not schema or col in schema) else None
+                if actual_col:
+                    filters.append({"column": actual_col, "operator": "=", "value": m.group(1)})
     return filters
 
 ############################################################
@@ -272,6 +285,7 @@ def extract_top_n_and_direction(text: str):
 def detect_dimension_from_text(text: str, schema: dict):
     t = (text or "").lower()
 
+    # Prefer schema exact column mentions first
     if schema:
         for col in schema.keys():
             if col.lower() in t:
@@ -354,6 +368,11 @@ def build_plan_from_metric(metric_key, question_text):
 
     tfs = parse_time_filters(question_text)
     plan["filters"].extend(tfs)
+
+    # Also extract explicit value filters like "transport sea" -> TransportMode = 'SEA'
+    schema = get_schema()
+    value_filters = extract_value_filters(question_text, schema)
+    plan["filters"].extend(value_filters)
 
     return plan
 
@@ -534,6 +553,8 @@ def extract_query(question: str):
 
     # parse time and value filters (initial)
     time_filters  = parse_time_filters(question)
+    schema = get_schema() or {}
+    # extract explicit value filters (e.g., transport sea)
     value_filters = extract_value_filters(question, schema)
 
     merged_filters = list(time_filters)
@@ -543,7 +564,7 @@ def extract_query(question: str):
         if isinstance(f, dict) and f.get("column") not in time_cols:
             merged_filters.append(f)
 
-    existing_cols = {f.get("column") for f in merged_filters}
+    existing_cols = {f.get("column") for f in merged_filters if isinstance(f, dict)}
     for vf in value_filters:
         if vf.get("column") not in existing_cols:
             merged_filters.append(vf)
@@ -558,7 +579,7 @@ def extract_query(question: str):
     if m_pair:
         y1 = int(m_pair.group(1))
         y2 = int(m_pair.group(2))
-        # normalize order (descending most recent first)
+        # normalize order (ascending older -> newer)
         yoy_years = sorted({y1, y2})
 
     # 2) "compare previous year and this year" or "compare previous year with this year"
@@ -566,7 +587,7 @@ def extract_query(question: str):
         if re.search(r"\b(previous year|last year)\b", qlow) and re.search(r"\b(this year|current year|present year)\b", qlow):
             this_y = current_utc().year
             prev_y = this_y - 1
-            # Interpret as financial years — use calendar_to_fy_year when needed? Keep as calendar years as user said years.
+            # Interpret as calendar years (user intent); kept simple
             yoy_years = [prev_y, this_y]
 
     # 3) "compare 2023 and last year" or "compare 2024 and previous year" (mixed)
@@ -583,7 +604,7 @@ def extract_query(question: str):
     # If we detected a YOY comparison, adjust merged_filters to include FinancialYear IN [years]
     if yoy_years:
         # Remove any existing FinancialYear equality filters from merged_filters
-        merged_filters = [f for f in merged_filters if not (f.get("column") == "FinancialYear" and f.get("operator") == "=")]
+        merged_filters = [f for f in merged_filters if not (isinstance(f, dict) and f.get("column") == "FinancialYear" and f.get("operator") == "=")]
         # Add an IN filter for the years (sql_builder supports operator 'in' with list)
         merged_filters.append({"column": "FinancialYear", "operator": "in", "value": yoy_years})
         # Ensure FinancialYear is in group_by so output is per-year (Format A)
@@ -599,14 +620,14 @@ def extract_query(question: str):
 
     plan["filters"] = merged_filters
 
-    # Now proceed with your existing select/group_by/top logic
+    # Now proceed with select/group_by/top logic
     selects  = plan.get("select", []) or []
     group_by = plan.get("group_by", []) or []
     order_by = plan.get("order_by", []) or []
     limit    = plan.get("limit")
 
     #########################################################
-    # 🔥 FORCE METRIC DETECTED FROM QUESTION
+    # 🔥 FORCE METRIC DETECTED FROM QUESTION (ensure metric present)
     #########################################################
     metric_key = detect_metric_from_text(question)
     if metric_key and metric_key in METRICS:
@@ -615,17 +636,15 @@ def extract_query(question: str):
         agg   = metric_info.get("aggregation")
         alias = metric_key
 
-        already = any(
-            isinstance(s, dict) and s.get("alias") == alias
-            for s in selects
-        )
+        # If we already have an explicit SELECT for this alias, don't duplicate
+        already = any(isinstance(s, dict) and s.get("alias") == alias for s in selects)
         if not already:
-            selects.append({
-                "column": None,
-                "expression": expr,
-                "aggregation": agg,
-                "alias": alias
-            })
+            # Insert metric SELECT after any group-by selects but before dimension selects so alias ordering is stable
+            inserts_at = 0
+            for i, s in enumerate(selects):
+                if isinstance(s, dict) and s.get("column") in group_by:
+                    inserts_at = i + 1
+            selects.insert(inserts_at, {"column": None, "expression": expr, "aggregation": agg, "alias": alias})
 
     plan["select"] = selects
 
@@ -638,14 +657,13 @@ def extract_query(question: str):
     #########################################################
     # 🔥 NUMERIC-LIMIT PATCH (YEAR-SAFE)
     # Only treat small numbers (1–100) as TOP limits.
-    # Ignore years (1900–2099)
+    # Ignore likely years (1000-2100)
     #########################################################
     explicit_n = None
     if not top_n:  # Only override when LLM did NOT already set a top_n
-        m = re.search(r"\b(\d+)\b", question)
+        m = re.search(r"\b(\d{1,3})\b", question)
         if m:
             num = int(m.group(1))
-            # treat typical top-n values as limits, ignore likely years
             if 1 <= num <= 100:
                 explicit_n = num
 
@@ -654,6 +672,7 @@ def extract_query(question: str):
         top_n = explicit_n
     #########################################################
 
+    # If a dimension is requested, ensure it's grouped and selected
     if dim_col:
         for col in schema.keys():
             if col.lower() == dim_col.lower():
@@ -663,21 +682,15 @@ def extract_query(question: str):
         if dim_col not in group_by:
             group_by.insert(0, dim_col)
 
-        dim_present = any(
-            isinstance(s, dict) and (s.get("alias") == dim_col or s.get("column") == dim_col)
-            for s in selects
-        )
+        # ensure dimension selected
+        dim_present = any(isinstance(s, dict) and (s.get("alias") == dim_col or s.get("column") == dim_col) for s in selects)
         if not dim_present:
-            selects.insert(0, {
-                "column": dim_col,
-                "expression": None,
-                "aggregation": None,
-                "alias": dim_col
-            })
+            selects.insert(0, {"column": dim_col, "expression": None, "aggregation": None, "alias": dim_col})
 
     if top_n:
         plan["limit"] = top_n
 
+    # Determine metric alias if any for ordering
     metric_alias = None
     for s in selects:
         if isinstance(s, dict) and (s.get("aggregation") or s.get("expression")):
@@ -701,7 +714,7 @@ def extract_query(question: str):
         if isinstance(s, dict):
             c = s.get("column")
             e = s.get("expression")
-            if (c and c.strip()) or (e and e.strip()):
+            if (c and str(c).strip()) or (e and str(e).strip()):
                 valid.append(s)
 
     if not valid:
@@ -722,17 +735,9 @@ def extract_query(question: str):
         alias = metric_key
 
         # Check if already exists
-        already = any(
-            isinstance(s, dict) and s.get("alias") == alias
-            for s in plan["select"]
-        )
+        already = any(isinstance(s, dict) and s.get("alias") == alias for s in plan["select"])
 
         if not already:
-            plan["select"].append({
-                "column": None,
-                "expression": expr,
-                "aggregation": agg,
-                "alias": alias
-            })
+            plan["select"].append({"column": None, "expression": expr, "aggregation": agg, "alias": alias})
 
     return plan
