@@ -3,6 +3,8 @@
 # 1) FORCE METRIC DETECTED FROM QUESTION
 # 2) Numeric-limit patch inserted IMMEDIATELY AFTER extract_top_n_and_direction()
 # 3) YOY detection: when user asks to compare two years (or previous/this), force FinancialYear IN (...) and group_by FinancialYear
+# 4) MOM detection (previous month / explicit month pairs) — add FinancialMonth + FinancialYear IN filters and group_by
+# 5) QoQ detection (previous quarter / explicit quarter pairs) — add FinancialQuarter + FinancialYear IN filters and group_by
 # Minimal, focused changes only — rest of your working logic preserved.
 
 import os
@@ -558,7 +560,7 @@ def extract_query(question: str):
     if m_pair:
         y1 = int(m_pair.group(1))
         y2 = int(m_pair.group(2))
-        # normalize order (descending most recent first)
+        # normalize order (ascending)
         yoy_years = sorted({y1, y2})
 
     # 2) "compare previous year and this year" or "compare previous year with this year"
@@ -566,7 +568,6 @@ def extract_query(question: str):
         if re.search(r"\b(previous year|last year)\b", qlow) and re.search(r"\b(this year|current year|present year)\b", qlow):
             this_y = current_utc().year
             prev_y = this_y - 1
-            # Interpret as financial years — use calendar_to_fy_year when needed? Keep as calendar years as user said years.
             yoy_years = [prev_y, this_y]
 
     # 3) "compare 2023 and last year" or "compare 2024 and previous year" (mixed)
@@ -586,16 +587,131 @@ def extract_query(question: str):
         merged_filters = [f for f in merged_filters if not (f.get("column") == "FinancialYear" and f.get("operator") == "=")]
         # Add an IN filter for the years (sql_builder supports operator 'in' with list)
         merged_filters.append({"column": "FinancialYear", "operator": "in", "value": yoy_years})
-        # Ensure FinancialYear is in group_by so output is per-year (Format A)
+        # Ensure FinancialYear is in group_by so output is per-year
         gb = plan.get("group_by", []) or []
         if "FinancialYear" not in gb:
             gb.insert(0, "FinancialYear")
             plan["group_by"] = gb
-        # Ensure FinancialYear is selected (so rows show year)
+        # Ensure FinancialYear is selected
         selects = plan.get("select", []) or []
         if not any(isinstance(s, dict) and (s.get("column") == "FinancialYear" or s.get("alias") == "FinancialYear") for s in selects):
             selects.insert(0, {"column": "FinancialYear", "expression": None, "aggregation": None, "alias": "FinancialYear"})
             plan["select"] = selects
+
+    # --- MOM detection (month-over-month) ---
+    # Support:
+    #  - "previous month and this month" / "compare previous month and this month"
+    #  - explicit pair: "Jan 2024 and Feb 2024" / "Jan 2024 vs Feb 2024"
+    mom_months = None
+    if not yoy_years:  # prefer YOY if that matched; otherwise MOM allowed
+        # 1) "previous month" and "this month"
+        if re.search(r"\b(previous month|last month)\b", qlow) and re.search(r"\b(this month|current month|present month)\b", qlow):
+            this_dt = current_utc()
+            prev_dt = (this_dt.replace(day=1) - timedelta(days=1))
+            this_fy = calendar_to_fy_year(this_dt.year, this_dt.month)
+            this_fm = calendar_to_fy_month(this_dt.month)
+            prev_fy = calendar_to_fy_year(prev_dt.year, prev_dt.month)
+            prev_fm = calendar_to_fy_month(prev_dt.month)
+            mom_months = [(prev_fy, prev_fm), (this_fy, this_fm)]
+
+        # 2) explicit month pairs like "Jan 2024 and Feb 2024" or "Jan 2023 vs Feb 2023"
+        if not mom_months:
+            m_month_pair = re.search(
+                r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(20\d{2})\b.*\b(?:and|vs|v|versus|to)\b.*\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(20\d{2})\b",
+                qlow
+            )
+            if m_month_pair:
+                m1 = datetime.strptime(m_month_pair.group(1)[:3], "%b").month
+                y1 = int(m_month_pair.group(2))
+                m2 = datetime.strptime(m_month_pair.group(3)[:3], "%b").month
+                y2 = int(m_month_pair.group(4))
+                fy1 = calendar_to_fy_year(y1, m1)
+                fy2 = calendar_to_fy_year(y2, m2)
+                fm1 = calendar_to_fy_month(m1)
+                fm2 = calendar_to_fy_month(m2)
+                mom_months = [(fy1, fm1), (fy2, fm2)]
+
+    if mom_months:
+        # Remove individual FinancialMonth / FinancialYear equality filters if present
+        merged_filters = [f for f in merged_filters if not (f.get("column") in ("FinancialMonth", "FinancialYear") and f.get("operator") == "=")]
+        # Build IN lists for months and years (main.py can detect these IN filters)
+        years = sorted({p[0] for p in mom_months})
+        months = sorted({p[1] for p in mom_months})
+        merged_filters.append({"column": "FinancialYear", "operator": "in", "value": years})
+        merged_filters.append({"column": "FinancialMonth", "operator": "in", "value": months})
+        # Ensure grouping by FinancialYear and FinancialMonth
+        gb = plan.get("group_by", []) or []
+        if "FinancialYear" not in gb:
+            gb.insert(0, "FinancialYear")
+        if "FinancialMonth" not in gb:
+            # place month after year
+            gb.insert(1 if "FinancialYear" in gb else 0, "FinancialMonth")
+        plan["group_by"] = gb
+        # Ensure selection includes both
+        selects = plan.get("select", []) or []
+        if not any(isinstance(s, dict) and (s.get("column") == "FinancialYear" or s.get("alias") == "FinancialYear") for s in selects):
+            selects.insert(0, {"column": "FinancialYear", "expression": None, "aggregation": None, "alias": "FinancialYear"})
+        if not any(isinstance(s, dict) and (s.get("column") == "FinancialMonth" or s.get("alias") == "FinancialMonth") for s in selects):
+            # insert after FinancialYear
+            inserts_at = 1 if any(isinstance(s, dict) and s.get("alias") == "FinancialYear" for s in selects) else 0
+            selects.insert(inserts_at, {"column": "FinancialMonth", "expression": None, "aggregation": None, "alias": "FinancialMonth"})
+        plan["select"] = selects
+
+    # --- QoQ detection (quarter-over-quarter) ---
+    # Support:
+    #  - "previous quarter and this quarter"
+    #  - explicit quarter pairs like "Q1 2023 and Q2 2023"
+    qoq_quarters = None
+    if not (yoy_years or mom_months):
+        # 1) previous quarter and this quarter
+        if re.search(r"\b(previous quarter|last quarter)\b", qlow) and re.search(r"\b(this quarter|current quarter|present quarter)\b", qlow):
+            this_dt = current_utc()
+            fy_this = calendar_to_fy_year(this_dt.year, this_dt.month)
+            fm_this = calendar_to_fy_month(this_dt.month)
+            q_this = ceil(fm_this/3)
+            # compute previous quarter fiscal tuple
+            if q_this == 1:
+                q_prev = 4
+                fy_prev = fy_this - 1
+            else:
+                q_prev = q_this - 1
+                fy_prev = fy_this
+            qoq_quarters = [(fy_prev, q_prev), (fy_this, q_this)]
+
+        # 2) explicit quarter pairs like "Q1 2023 and Q2 2023"
+        if not qoq_quarters:
+            m_q_pair = re.search(r"\bq([1-4])\s*(20\d{2})\b.*\b(?:and|vs|v|versus|to)\b.*\bq([1-4])\s*(20\d{2})\b", qlow)
+            if m_q_pair:
+                q1 = int(m_q_pair.group(1))
+                y1 = int(m_q_pair.group(2))
+                q2 = int(m_q_pair.group(3))
+                y2 = int(m_q_pair.group(4))
+                fy1 = calendar_to_fy_year(y1, (q1-1)*3 + 3)  # approximate month -> fy
+                fy2 = calendar_to_fy_year(y2, (q2-1)*3 + 3)
+                qoq_quarters = [(fy1, q1), (fy2, q2)]
+
+    if qoq_quarters:
+        # Remove any existing FinancialQuarter / FinancialYear equality filters
+        merged_filters = [f for f in merged_filters if not (f.get("column") in ("FinancialQuarter", "FinancialYear") and f.get("operator") == "=")]
+        years = sorted({p[0] for p in qoq_quarters})
+        quarters = sorted({p[1] for p in qoq_quarters})
+        merged_filters.append({"column": "FinancialYear", "operator": "in", "value": years})
+        merged_filters.append({"column": "FinancialQuarter", "operator": "in", "value": quarters})
+        # Ensure grouping by FinancialYear and FinancialQuarter
+        gb = plan.get("group_by", []) or []
+        if "FinancialYear" not in gb:
+            gb.insert(0, "FinancialYear")
+        if "FinancialQuarter" not in gb:
+            gb.insert(1 if "FinancialYear" in gb else 0, "FinancialQuarter")
+        plan["group_by"] = gb
+        # Ensure selection includes both
+        selects = plan.get("select", []) or []
+        if not any(isinstance(s, dict) and (s.get("column") == "FinancialYear" or s.get("alias") == "FinancialYear") for s in selects):
+            selects.insert(0, {"column": "FinancialYear", "expression": None, "aggregation": None, "alias": "FinancialYear"})
+        if not any(isinstance(s, dict) and (s.get("column") == "FinancialQuarter" or s.get("alias") == "FinancialQuarter") for s in selects):
+            inserts_at = 1 if any(isinstance(s, dict) and s.get("alias") == "FinancialYear" for s in selects) else 0
+            selects.insert(inserts_at, {"column": "FinancialQuarter", "expression": None, "aggregation": None, "alias": "FinancialQuarter"})
+        plan["select"] = selects
 
     plan["filters"] = merged_filters
 
@@ -736,4 +852,3 @@ def extract_query(question: str):
             })
 
     return plan
-
